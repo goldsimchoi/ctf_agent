@@ -1,0 +1,12 @@
+id: example
+category: pwn
+binary: input/chall
+# libc: input/libc.so.6
+# loader: input/ld-linux-x86-64.so.2
+# network_access: user_only
+# host: challenge.example
+# port: 31337
+# flag_patterns:
+#   - 'FLAG\{[^}\r\n]+\}'
+# timeout_seconds: 300
+# authorized: true
