@@ -1,0 +1,16 @@
+interface:
+  display_name: "Pwn Agent"
+  short_description: "Solve authorized CTF pwnables and verify flags"
+  default_prompt: "Use $pwn-agent to solve this authorized pwn challenge and return a verified flag."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "pwndbg"
+      description: "Stateful GDB and pwndbg debugging in WSL"
+      transport: "stdio"
+    - type: "mcp"
+      value: "idapro"
+      description: "IDA Pro analysis through the local RPC bridge"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true
