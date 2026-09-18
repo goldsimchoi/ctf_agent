@@ -239,6 +239,66 @@ class BarrierHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class RawBodyHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        self.server.hits += 1
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.server.bodies.append(body)
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class FailedOutboundHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        self.server.hits += 1
+        self.server.stored = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        self.server.accepted.set()
+        self.send_response(200)
+        self.send_header("Content-Length", "64")
+        self.end_headers()
+        self.wfile.write(b"partial")
+        self.wfile.flush()
+        time.sleep(1)
+
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        body = self.server.stored
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class ChainHandler(http.server.BaseHTTPRequestHandler):
+    def _reply(self, body: bytes, redirect: str | None = None) -> None:
+        self.send_response(302 if redirect else 200)
+        if redirect:
+            self.send_header("Location", redirect)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        if self.path == "/start":
+            self._reply(b"FLAG{same_chain}", "/final")
+        elif self.path == "/final":
+            self._reply(b"FLAG{same_chain}")
+        else:
+            self._reply(b"nothing here")
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
 @contextmanager
 def local_server(handler: type[http.server.BaseHTTPRequestHandler]):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -426,6 +486,98 @@ class WebAgentTests(unittest.TestCase):
             self.assertFalse(provenance["body_capture"]["wire_exact"])
             self.assertEqual(provenance["body_capture"]["content_encoding"], "gzip")
             self.assertIn("HTTP framing", provenance["body_capture"]["transport_limitations"])
+
+    def test_raw_plain_and_binary_request_bodies_are_echo_evidence(self) -> None:
+        with local_server(RawBodyHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.bodies = []
+            workspace = self.make_workspace(Path(temp), "web-raw-body", origin)
+            self.init_web_state(workspace)
+            plain = json.loads(self.request(
+                workspace, origin + "/plain", "--method", "POST",
+                "--header", "Content-Type=text/plain", "--data", "prefix FLAG{plain_body_echo}",
+                "--progress", "new fact: plain raw body",
+            ).stdout)
+            binary_source = workspace / "artifacts" / "binary-input"
+            binary_source.write_bytes(b"\x00\xffFLAG{binary_body_echo}\x80")
+            binary = json.loads(run_script(
+                REQUEST, "--workspace", str(workspace), "--url", origin + "/binary", "--method", "POST",
+                "--header", "Content-Type=application/octet-stream", "--data-file", str(binary_source),
+                "--progress", "new fact: binary raw body",
+            ).stdout)
+
+            self.assertEqual(server.bodies, [b"prefix FLAG{plain_body_echo}", b"\x00\xffFLAG{binary_body_echo}\x80"])
+            for captured in (plain, binary):
+                rejected = self.verify(workspace, "--output", captured["response_entity_body"])
+                self.assertEqual(rejected.returncode, 2)
+                self.assertEqual(json.loads(rejected.stdout)["status"], "unverified")
+
+    def test_failed_outbound_request_stays_in_history_and_blocks_later_echo(self) -> None:
+        with local_server(FailedOutboundHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.accepted = threading.Event()
+            server.stored = b""
+            workspace = self.make_workspace(Path(temp), "web-incomplete", origin)
+            self.init_web_state(workspace)
+            failed = self.request(
+                workspace, origin + "/store", "--method", "POST", "--data", "FLAG{failed_send_echo}",
+                "--timeout", "0.1", "--progress", "new fact: timeout after store",
+            )
+            self.assertEqual(failed.returncode, 2, failed.stderr)
+            self.assertTrue(server.accepted.wait(timeout=2))
+            history = json.loads((workspace / "web" / "history.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(history["requests"]), 1)
+            self.assertFalse(history["requests"][0]["complete"])
+            self.assertTrue(Path(history["requests"][0]["request"]).is_file())
+            self.assertEqual(list((workspace / "web" / "captures").iterdir()), [])
+
+            reflected = json.loads(self.request(
+                workspace, origin + "/return", "--progress", "new fact: stored value returned"
+            ).stdout)
+            rejected = self.verify(workspace, "--output", reflected["response_entity_body"])
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(json.loads(rejected.stdout)["status"], "unverified")
+
+    def test_strict_rejects_duplicate_redirect_chain_with_unrelated_output(self) -> None:
+        with local_server(ChainHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-strict-chain", origin)
+            self.init_web_state(workspace)
+            chain = json.loads(self.request(workspace, origin + "/start", "--progress", "new fact: redirect chain").stdout)
+            unrelated = json.loads(self.request(workspace, origin + "/other", "--progress", "new fact: unrelated output").stdout)
+            bodies = json.loads(Path(chain["summary"]).read_text(encoding="utf-8"))["response_entity_bodies"]
+            rejected = self.verify(workspace, "--strict", "--output", bodies[0], "--output", bodies[1], "--output", unrelated["response_entity_body"])
+
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(json.loads(rejected.stdout)["status"], "error")
+
+    def test_web_state_rejects_symlinked_root_and_swapped_write_or_lock_targets(self) -> None:
+        with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.external_url = origin
+            root = Path(temp)
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("unchanged", encoding="utf-8")
+
+            initial = self.make_workspace(root, "web-symlink-init", origin)
+            (initial / "web").symlink_to(outside, target_is_directory=True)
+            init = run_script(SKILL_DIR / "scripts" / "init_web_state.py", "--workspace", str(initial))
+            self.assertEqual(init.returncode, 2)
+            self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
+
+            swapped = self.make_workspace(root, "web-symlink-write", origin)
+            self.init_web_state(swapped)
+            responses = swapped / "web" / "responses"
+            responses.rmdir()
+            responses.symlink_to(outside, target_is_directory=True)
+            write_rejected = self.request(swapped, origin + "/gzip", "--progress", "new fact: swapped response directory")
+            self.assertEqual(write_rejected.returncode, 2)
+            self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
+
+            locked = self.make_workspace(root, "web-symlink-lock", origin)
+            self.init_web_state(locked)
+            (locked / "web" / ".history.lock").symlink_to(outside / "lock")
+            lock_rejected = self.request(locked, origin + "/gzip", "--progress", "new fact: swapped history lock")
+            self.assertEqual(lock_rejected.returncode, 2)
+            self.assertEqual(sorted(path.name for path in outside.iterdir()), ["sentinel"])
 
     def test_request_publishes_capture_time_common_attestation(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:

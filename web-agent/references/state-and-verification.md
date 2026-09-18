@@ -13,10 +13,13 @@ record in this session. Summaries and captured errors are not confirmation evide
 
 Race verification accepts one flag in a recorded authorized target response only
 if it was not present in its capture-time bounded sent-history evidence. Strict
-mode requires two distinct authorized request and capture IDs. Run
+mode requires at least two submitted outputs and every output must have a
+different authorized request-chain ID and capture ID. Run
 `scripts/verify_web_flag.py`, not the common verifier directly; it validates
 provenance and forwards only the existing common attestation/output/sent trio.
 
 Requests in one session serialize their history transaction so each later
-capture includes earlier submissions. This lock is session-local; separate web
-sessions remain independent.
+capture includes earlier submissions. Prepared evidence is committed before
+each outbound dispatch; failed or timed-out sends remain incomplete history
+entries and are still included in later echo checks. This lock is session-local;
+separate web sessions remain independent.

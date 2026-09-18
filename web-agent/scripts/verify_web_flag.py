@@ -28,9 +28,11 @@ def main() -> int:
         captures = [record.get("capture") for record in records]
         if not all(isinstance(capture, dict) for capture in captures):
             raise WebStateError("every response requires a capture-time attestation")
+        request_ids = [str(record["request_id"]) for record in records]
         if args.strict and (
-            len({str(record["request_id"]) for record in records}) < 2
-            or len({str(capture["capture_id"]) for capture in captures}) < 2
+            len(records) < 2
+            or len(set(request_ids)) != len(request_ids)
+            or len({str(capture["capture_id"]) for capture in captures}) != len(captures)
         ):
             raise WebStateError("strict mode requires two distinct authorized web requests")
         command = [sys.executable, str(COMMON), "--workspace", str(workspace)]

@@ -11,7 +11,9 @@ boundaries with `wire_exact: false`.
 For supported identity, gzip, and deflate bodies, capture writes a bounded
 decoded scan body and bounded sent-history artifact, then publishes the common
 capture attestation immediately. The sent history retains prior session traffic,
-redirect hops, prepared bytes, and supported URL/form/JSON semantic values.
+redirect hops, exact decoded prepared body bytes for every content type, and
+supported URL/form/JSON semantic values. Failed sends retain their staged
+prepared evidence as incomplete history, but publish no response attestation.
 
 Decoding is incremental and capped at the common artifact limit. Oversized
 entity bodies, trailing compressed data, malformed streams, and unsupported

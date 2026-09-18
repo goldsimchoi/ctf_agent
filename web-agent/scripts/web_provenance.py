@@ -5,31 +5,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import os
 import sys
-import tempfile
 import zlib
 from pathlib import Path
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from init_web_state import WebStateError, session_workspace
+from init_web_state import WebStateError, atomic_json as safe_atomic_json, session_workspace
 
 
 COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "ctf-common" / "scripts"
 sys.path.insert(0, str(COMMON_SCRIPTS))
-from ctf_workspace import MAX_ARTIFACT_BYTES, InvalidInput, _read_regular_under  # noqa: E402
-
-
-def _under(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+from ctf_workspace import MAX_ARTIFACT_BYTES, InvalidInput, _read_regular_under, _write_new_bytes, _write_new_json  # noqa: E402
 
 
 def _origin(value: str) -> str:
@@ -50,8 +36,8 @@ def manifest_origin(workspace: Path) -> str:
     workspace = session_workspace(workspace)
     values: dict[str, str] = {}
     try:
-        lines = (workspace / "challenge.resolved.yaml").read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        lines = _read_regular_under(workspace, workspace / "challenge.resolved.yaml", "resolved manifest").data.decode("utf-8").splitlines()
+    except (InvalidInput, UnicodeDecodeError) as exc:
         raise WebStateError("web session has no resolved manifest") from exc
     for line in lines:
         if ":" not in line or line.lstrip().startswith("#"):
@@ -68,36 +54,24 @@ def manifest_origin(workspace: Path) -> str:
 
 
 def atomic_json(path: Path, payload: dict) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+        safe_atomic_json(path, payload)
+    except WebStateError:
         raise
 
 
 def atomic_bytes(path: Path, payload: bytes) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
+        _write_new_bytes(path, payload)
+    except (InvalidInput, OSError) as exc:
+        raise WebStateError("unsafe web evidence write") from exc
+
+
+def write_new_json(path: Path, payload: dict) -> None:
+    try:
+        _write_new_json(path, payload)
+    except (InvalidInput, OSError) as exc:
+        raise WebStateError("unsafe web evidence write") from exc
 
 
 def _bounded_zlib(body: bytes, wbits: int) -> bytes | None:
@@ -173,7 +147,14 @@ def prepared_sent_evidence(prepared_bytes: bytes) -> bytes:
             return []
 
         semantic.extend(f"json:{value}" for value in scalars(payload))
-    return b"prepared-record:\n" + prepared_bytes + b"\n\nsemantic-inputs:\n" + "\n".join(semantic).encode("utf-8", errors="replace")
+    evidence = (
+        b"prepared-record:\n" + prepared_bytes
+        + b"\n\nbody-bytes:\n" + body
+        + b"\n\nsemantic-inputs:\n" + "\n".join(semantic).encode("utf-8", errors="replace")
+    )
+    if len(evidence) > MAX_ARTIFACT_BYTES:
+        raise WebStateError("prepared sent evidence exceeds the common artifact limit")
+    return evidence
 
 
 def sent_history(workspace: Path, prepared_paths: list[Path]) -> bytes | None:
