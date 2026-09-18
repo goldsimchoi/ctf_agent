@@ -12,6 +12,7 @@ must point to an unchanged response entity body with an authorized provenance
 record in this session. Summaries and captured errors are not confirmation evidence.
 
 Race verification accepts one flag in a recorded authorized target response only
-if it was not present in its saved prepared-request evidence. Strict mode requires
-two distinct authorized request IDs. Run `scripts/verify_web_flag.py`, not the
-common verifier directly; it validates provenance before candidate verification.
+if it was not present in its capture-time bounded sent-history evidence. Strict
+mode requires two distinct authorized request and capture IDs. Run
+`scripts/verify_web_flag.py`, not the common verifier directly; it validates
+provenance and forwards only the existing common attestation/output/sent trio.

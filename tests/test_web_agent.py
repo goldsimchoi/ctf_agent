@@ -85,6 +85,57 @@ class EchoHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class HistoryHandler(http.server.BaseHTTPRequestHandler):
+    def _reply(self, body: str) -> None:
+        data = body.encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        parsed = urlsplit(self.path)
+        values = [value for _, value in parse_qsl(parsed.query, keep_blank_values=True)]
+        if parsed.path == "/redirect-start":
+            self.server.redirect_value = next(value for value in values if value.startswith("FLAG{"))
+            self.send_response(302)
+            self.send_header("Location", "/redirect-final")
+            self.end_headers()
+        elif parsed.path == "/redirect-final":
+            self._reply(self.server.redirect_value)
+        elif parsed.path == "/remember":
+            self.server.previous_value = next(value for value in values if value.startswith("FLAG{"))
+            self._reply("stored")
+        elif parsed.path == "/return":
+            self._reply(self.server.previous_value)
+        elif parsed.path == "/return-form":
+            self._reply(self.server.previous_form)
+        elif parsed.path == "/return-json":
+            self._reply(self.server.previous_json)
+        else:
+            self.send_error(404)
+
+    def do_POST(self) -> None:
+        self.server.hits += 1
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        if self.path == "/remember-form":
+            self.server.previous_form = next(value for _, value in parse_qsl(body) if value.startswith("FLAG{"))
+            self._reply("stored")
+        else:
+            payload = json.loads(body)
+            value = payload["nested"]["flag"]
+            if self.path == "/remember-json":
+                self.server.previous_json = value
+                self._reply("stored")
+            else:
+                self._reply(value)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
 @contextmanager
 def local_server(handler: type[http.server.BaseHTTPRequestHandler]):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -272,6 +323,83 @@ class WebAgentTests(unittest.TestCase):
             self.assertFalse(provenance["body_capture"]["wire_exact"])
             self.assertEqual(provenance["body_capture"]["content_encoding"], "gzip")
             self.assertIn("HTTP framing", provenance["body_capture"]["transport_limitations"])
+
+    def test_request_publishes_capture_time_common_attestation(self) -> None:
+        with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.external_url = origin
+            workspace = self.make_workspace(Path(temp), "web-attestation", origin)
+            self.init_web_state(workspace)
+            captured = json.loads(self.request(
+                workspace, origin + "/gzip", "--progress", "new fact: attested target"
+            ).stdout)
+            provenance = json.loads(Path(captured["provenance"]).read_text(encoding="utf-8"))
+            attestation = Path(captured["attestation"])
+            record = json.loads(attestation.read_text(encoding="utf-8"))
+
+            self.assertTrue(attestation.is_file())
+            self.assertEqual(attestation.parent, workspace / "artifacts" / "captures")
+            self.assertEqual(record["source_target"], origin + "/gzip")
+            self.assertEqual(record["output"]["path"], provenance["capture"]["output"])
+            self.assertEqual(record["sent"]["path"], provenance["capture"]["sent"])
+
+    def test_verifier_rejects_current_json_redirect_and_prior_session_echoes(self) -> None:
+        with local_server(HistoryHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-history", origin)
+            self.init_web_state(workspace)
+            current_json = json.loads(self.request(
+                workspace, origin + "/json", "--method", "POST",
+                "--header", "Content-Type=application/json",
+                "--json", '{"nested":{"flag":"FLAG{json_echo}"}}',
+                "--progress", "new fact: JSON echo",
+            ).stdout)
+            redirect = json.loads(self.request(
+                workspace, origin + "/redirect-start?x=FLAG%7Bredirect_echo%7D",
+                "--progress", "new fact: redirect echo",
+            ).stdout)
+            self.request(
+                workspace, origin + "/remember?x=FLAG%7Bprior_echo%7D",
+                "--progress", "new fact: prior query",
+            )
+            prior = json.loads(self.request(
+                workspace, origin + "/return", "--progress", "new fact: prior reflection"
+            ).stdout)
+            self.request(
+                workspace, origin + "/remember-form", "--method", "POST",
+                "--header", "Content-Type=application/x-www-form-urlencoded",
+                "--data", "x=FLAG%7Bprior_form%7D",
+                "--progress", "new fact: prior form",
+            )
+            prior_form = json.loads(self.request(
+                workspace, origin + "/return-form", "--progress", "new fact: prior form reflection"
+            ).stdout)
+            self.request(
+                workspace, origin + "/remember-json", "--method", "POST",
+                "--header", "Content-Type=application/json",
+                "--json", '{"nested":{"flag":"FLAG{prior_json}"}}',
+                "--progress", "new fact: prior JSON",
+            )
+            prior_json = json.loads(self.request(
+                workspace, origin + "/return-json", "--progress", "new fact: prior JSON reflection"
+            ).stdout)
+
+            self.assertEqual(self.verify(workspace, "--output", current_json["response_entity_body"]).returncode, 2)
+            self.assertEqual(self.verify(workspace, "--output", redirect["response_entity_body"]).returncode, 2)
+            self.assertEqual(self.verify(workspace, "--output", prior["response_entity_body"]).returncode, 2)
+            self.assertEqual(self.verify(workspace, "--output", prior_form["response_entity_body"]).returncode, 2)
+            self.assertEqual(self.verify(workspace, "--output", prior_json["response_entity_body"]).returncode, 2)
+
+    def test_web_verifier_rejects_tampered_attested_capture(self) -> None:
+        with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.external_url = origin
+            workspace = self.make_workspace(Path(temp), "web-tamper", origin)
+            self.init_web_state(workspace)
+            captured = json.loads(self.request(
+                workspace, origin + "/gzip", "--progress", "new fact: capture for tamper"
+            ).stdout)
+            provenance = json.loads(Path(captured["provenance"]).read_text(encoding="utf-8"))
+            Path(provenance["capture"]["output"]).write_bytes(b"FLAG{tampered}")
+
+            self.assertEqual(self.verify(workspace, "--output", captured["response_entity_body"]).returncode, 2)
 
     def test_request_rejects_target_origin_and_non_web_session_before_traffic(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:

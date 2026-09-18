@@ -23,8 +23,8 @@ adapts the coverage-ledger and state-discipline lessons from TeamH4C's
 
    Keep inputs read-only. The returned session owns `web/cookies.json`,
   `web/browser-profile/`, `web/requests/`, `web/responses/`, and response
-  provenance, plus the coverage ledger and capabilities. Never share a cookie
-  jar or browser profile.
+  provenance, capture scans, bounded sent history, plus the coverage ledger and
+  capabilities. Never share a cookie jar or browser profile.
 3. Read existing immutable findings before one cheap triage pass. Reuse only
    evidence-backed facts from the matching fingerprint.
 
@@ -40,6 +40,9 @@ and WebSocket/message payloads.
 - Save prepared-request evidence and undecoded response entity-body bytes;
   provenance retains parsed status/headers, redirects, length, timing, cookie
   changes, and parsing/tool errors. These are not literal HTTP wire captures.
+- Each supported capture publishes a common immutable attestation at capture
+  time, binding a bounded decoded scan body and the full prior/redirect-chain
+  sent history. Do not create verification artifacts later.
 - Record normalized requests through the common attempt ledger before sending;
   unchanged failures are rejected. After two no-progress attempts, change the
   hypothesis/strategy rather than repeat it.
@@ -61,7 +64,7 @@ Playwright or WebSocket work, passing this session's browser profile.
 Default `mode: race` reports the first non-echoed flag attributable to a
 recorded authorized target response immediately. Use the web verifier; it
 rejects shell files, summaries, errors, and unprovenanced artifacts before it
-delegates candidate checking:
+maps pre-existing capture attestations to common candidate checking:
 
 ```text
 python3 <skill>/scripts/verify_web_flag.py --workspace <workspace> \

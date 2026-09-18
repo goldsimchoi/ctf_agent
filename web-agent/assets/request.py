@@ -20,8 +20,10 @@ import requests
 SKILL = Path(__file__).resolve().parents[1]
 COMMON = SKILL.parent / "ctf-common" / "scripts"
 sys.path.insert(0, str(SKILL / "scripts"))
+sys.path.insert(0, str(COMMON))
 from init_web_state import WebStateError, session_workspace  # noqa: E402
-from web_provenance import atomic_json, manifest_origin  # noqa: E402
+from web_provenance import atomic_bytes, atomic_json, decode_entity_body, manifest_origin, sent_history  # noqa: E402
+from ctf_workspace import MAX_ARTIFACT_BYTES, CollisionError, InvalidInput, _read_regular_under, publish_capture_attestation  # noqa: E402
 
 
 def origin_of(url: str) -> str:
@@ -84,7 +86,15 @@ def _headers(response: requests.Response) -> list[list[str]]:
     return [[str(name), str(value)] for name, value in values]
 
 
-def capture_hop(workspace: Path, request_id: str, hop: int, response: requests.Response, origin: str) -> tuple[Path, Path, Path]:
+def capture_hop(
+    workspace: Path,
+    session_record: dict,
+    request_id: str,
+    hop: int,
+    response: requests.Response,
+    origin: str,
+    prior_requests: list[Path],
+) -> tuple[Path, Path, Path, Path | None]:
     """Save undecoded entity bytes plus parsed protocol facts and request provenance.
 
     urllib3 exposes the entity body after HTTP framing but before content-encoding
@@ -97,14 +107,48 @@ def capture_hop(workspace: Path, request_id: str, hop: int, response: requests.R
     request_file = web / "requests" / f"{request_id}-{hop}.prepared.json"
     response_file = web / "responses" / f"{request_id}-{hop}.body"
     provenance_file = web / "provenance" / f"{request_id}-{hop}.json"
-    entity_body = response.raw.read(decode_content=False)
+    entity_body = response.raw.read(MAX_ARTIFACT_BYTES + 1, decode_content=False)
+    complete_body = len(entity_body) <= MAX_ARTIFACT_BYTES
+    if not complete_body:
+        entity_body = entity_body[:MAX_ARTIFACT_BYTES]
     atomic_json(request_file, {
         "method": prepared.method, "url": prepared.url,
         "headers": [[str(name), str(value)] for name, value in prepared.headers.items()],
         "body_base64": base64.b64encode(prepared_body).decode("ascii"), "wire_exact": False,
     })
-    response_file.write_bytes(entity_body)
-    atomic_json(provenance_file, {
+    atomic_bytes(response_file, entity_body)
+    history = sent_history(workspace, [*prior_requests, request_file])
+    capture_id = f"web-{request_id}-{hop}"
+    capture: dict[str, str] | None = None
+    if complete_body and history is not None:
+        candidate = decode_entity_body(entity_body, response.headers.get("Content-Encoding"))
+        if candidate is not None:
+            output_file = web / "captures" / f"{capture_id}.output"
+            sent_file = web / "captures" / f"{capture_id}.sent"
+            atomic_bytes(output_file, candidate)
+            atomic_bytes(sent_file, history)
+            attestation_record = {
+                "schema_version": 1,
+                "workspace": str(workspace),
+                "session_id": session_record["session_id"],
+                "category": "web",
+                "capture_id": capture_id,
+                "source_target": prepared.url,
+                "output": {"path": str(output_file), "sha256": hashlib.sha256(candidate).hexdigest()},
+                "sent": {"path": str(sent_file), "sha256": hashlib.sha256(history).hexdigest()},
+            }
+            attestation = publish_capture_attestation(workspace, attestation_record)
+            attestation_snapshot = _read_regular_under(workspace, attestation, "capture attestation")
+            capture = {
+                "capture_id": capture_id,
+                "attestation": str(attestation),
+                "attestation_sha256": hashlib.sha256(attestation_snapshot.data).hexdigest(),
+                "output": str(output_file),
+                "output_sha256": hashlib.sha256(candidate).hexdigest(),
+                "sent": str(sent_file),
+                "sent_sha256": hashlib.sha256(history).hexdigest(),
+            }
+    provenance = {
         "schema_version": 1, "kind": "web-http-response-v1", "request_id": request_id, "hop": hop,
         "authorized": True, "authorized_origin": origin, "request_url": prepared.url,
         "request": str(request_file), "request_sha256": hashlib.sha256(request_file.read_bytes()).hexdigest(),
@@ -114,11 +158,15 @@ def capture_hop(workspace: Path, request_id: str, hop: int, response: requests.R
             "kind": "urllib3_undecoded_entity_body", "wire_exact": False,
             "content_encoding": response.headers.get("Content-Encoding"),
             "content_encoding_decoded": False,
+            "complete": complete_body,
             "transport_limitations": "HTTP framing and original header wire serialization are unavailable through requests.",
         },
         "request_capture": {"kind": "requests_prepared_request", "wire_exact": False},
-    })
-    return request_file, response_file, provenance_file
+    }
+    if capture is not None:
+        provenance["capture"] = capture
+    atomic_json(provenance_file, provenance)
+    return request_file, response_file, provenance_file, Path(capture["attestation"]) if capture else None
 
 
 def main() -> int:
@@ -152,11 +200,26 @@ def main() -> int:
             request_args["data"] = pairs(args.form)
         request_id = secrets.token_hex(12)
         method, url, captures = args.method.upper(), args.url, []
+        try:
+            session_record = json.loads(
+                _read_regular_under(workspace, workspace / "session.json", "web session").data.decode("utf-8")
+            )
+            history_file = web / "history.json"
+            history = json.loads(
+                _read_regular_under(workspace, history_file, "web capture history").data.decode("utf-8")
+            )
+            prior_requests = [Path(item) for item in history["requests"]]
+        except (InvalidInput, OSError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WebStateError("invalid web capture history") from exc
         started = time.monotonic()
         for hop in range(6):
             response = session.request(method, url, **request_args)
-            request_file, response_file, provenance_file = capture_hop(workspace, request_id, hop, response, origin)
-            captures.append((request_file, response_file, provenance_file, response))
+            request_file, response_file, provenance_file, attestation = capture_hop(
+                workspace, session_record, request_id, hop, response, origin, prior_requests
+            )
+            captures.append((request_file, response_file, provenance_file, response, attestation))
+            prior_requests.append(request_file)
+            atomic_json(history_file, {"schema_version": 1, "requests": [str(path) for path in prior_requests]})
             location = response.headers.get("Location") if response.is_redirect else None
             if not location:
                 break
@@ -169,7 +232,7 @@ def main() -> int:
         else:
             raise ValueError("redirect limit reached")
         elapsed_ms = round((time.monotonic() - started) * 1000, 3)
-        final_request, final_response, final_provenance, final = captures[-1]
+        final_request, final_response, final_provenance, final, final_attestation = captures[-1]
         summary_file = web / "responses" / f"{request_id}.summary.json"
         atomic_json(summary_file, {
             "request_id": request_id, "requests": [str(item[0]) for item in captures],
@@ -179,11 +242,11 @@ def main() -> int:
             "set_cookie": final.headers.get("Set-Cookie"),
         })
         save_session(session, web / "cookies.json")
-        for _, _, _, response in captures:
+        for _, _, _, response, _ in captures:
             response.close()
-        print(json.dumps({"prepared_request": str(final_request), "response_entity_body": str(final_response), "provenance": str(final_provenance), "summary": str(summary_file)}))
+        print(json.dumps({"prepared_request": str(final_request), "response_entity_body": str(final_response), "provenance": str(final_provenance), "attestation": str(final_attestation) if final_attestation else None, "summary": str(summary_file)}))
         return 0
-    except (OSError, ValueError, WebStateError, json.JSONDecodeError, requests.RequestException) as exc:
+    except (OSError, ValueError, WebStateError, InvalidInput, CollisionError, json.JSONDecodeError, requests.RequestException) as exc:
         error_file = args.workspace.expanduser().resolve() / "web" / "responses" / f"{time.time_ns()}.error.json"
         if error_file.parent.is_dir():
             atomic_json(error_file, {"error": str(exc)})

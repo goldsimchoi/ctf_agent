@@ -55,15 +55,18 @@ def init_web_state(workspace: Path) -> dict[str, str]:
     requests_dir = web / "requests"
     responses_dir = web / "responses"
     provenance_dir = web / "provenance"
+    captures_dir = web / "captures"
     profile = web / "browser-profile"
-    for directory in (requests_dir, responses_dir, provenance_dir, profile):
+    for directory in (requests_dir, responses_dir, provenance_dir, captures_dir, profile):
         directory.mkdir(parents=True, exist_ok=True)
     cookies = web / "cookies.json"
     coverage = web / "coverage.json"
     capabilities = web / "capabilities.json"
+    history = web / "history.json"
     _atomic_create_json(cookies, {"cookies": [], "schema_version": 1})
     _atomic_create_json(coverage, {"entries": [], "schema_version": 1})
     _atomic_create_json(capabilities, {"capabilities": [], "schema_version": 1})
+    _atomic_create_json(history, {"requests": [], "schema_version": 1})
     return {
         "workspace": str(workspace),
         "web_root": str(web),
@@ -73,6 +76,8 @@ def init_web_state(workspace: Path) -> dict[str, str]:
         "requests_dir": str(requests_dir),
         "responses_dir": str(responses_dir),
         "provenance_dir": str(provenance_dir),
+        "captures_dir": str(captures_dir),
+        "history": str(history),
         "capabilities": str(capabilities),
     }
 

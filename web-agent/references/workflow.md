@@ -8,7 +8,8 @@
 3. Before each target interaction, use the common `record_attempt.py` signature
    guard. Mark a tuple `tested`, `promising`, `confirmed`, or `discarded` with
    `record_coverage.py`; confirmation requires a provenance-verified response
-   entity-body evidence path.
+   entity-body evidence path. Supported captures publish the bounded common
+   attestation immediately; verification never creates it.
 4. On a capability, update `web/capabilities.json` with capability, evidence,
    and next shortest action. Do not keep broadening probes after a direct path
    to the objective appears.
