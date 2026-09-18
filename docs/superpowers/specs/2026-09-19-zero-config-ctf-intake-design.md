@@ -97,18 +97,23 @@ Extend the common initializer interface without removing existing calls:
 ```text
 init_session.py <challenge-dir> --category {pwn,web,rev}
                 [--event-root PATH] [--session-id ID]
+                [--request-json {-|PATH}]
                 [--statement TEXT] [--target TEXT]
                 [--binary RELATIVE_PATH]
                 [--flag-pattern PATTERN]
 ```
 
-The category skill passes the exact free-form statement through `--statement`.
-It passes only a target or binary it selected from that statement and the
-supplied artifacts. Arguments are supplied as literal process arguments, not
-shell-evaluated content. The helper rejects NUL characters, unreasonably large
-statement/field values, invalid Unicode boundaries, and category-incompatible
-fields. The stored statement limit is 256 KiB; target, binary, and flag-pattern
-fields are each bounded to 4 KiB.
+The category skill uses `--request-json -` and writes exactly one JSON object to
+the initializer's standard input, with optional `statement`, `target`,
+`binary`, and `flag_pattern` string fields. This is the normal agent path: CTF
+prose never appears in a shell command. A regular-file path may replace `-` for
+automation, and the individual flags remain convenient backwards-compatible
+inputs; mixing JSON and individual intake fields is rejected. The helper
+passes only a target or binary selected from the statement and supplied
+artifacts. It rejects NUL characters, oversized input before unbounded
+allocation, unknown JSON keys, non-string values, invalid Unicode boundaries,
+and category-incompatible fields. The stored statement limit is 256 KiB;
+target, binary, and flag-pattern fields are each bounded to 4 KiB.
 
 The initializer returns its existing JSON plus:
 
