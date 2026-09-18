@@ -8,6 +8,7 @@ CTF_ROOT=${CTF_TOOLS_ROOT:-/home/normalone/CTF}
 VENV="$CTF_ROOT/.venv"
 LOCAL_BIN=${CTF_TOOLS_LOCAL_BIN:-/home/normalone/.local/bin}
 LOCAL_OPT=${CTF_TOOLS_LOCAL_OPT:-/home/normalone/.local/opt}
+LOCAL_PREFIX=${CTF_TOOLS_LOCAL_PREFIX:-"$(dirname "$LOCAL_BIN")"}
 R2_REVISION=8e57aff6dc36517bbab2aff199154f099e3471ea
 SQLMAP_REVISION=5365c7e53d03c268b14cfc924398340d1365e863
 NUCLEI_VERSION=3.11.1
@@ -68,6 +69,17 @@ pin_revision() {
     DEGRADED+=("$label: revision mismatch (expected $revision, got $actual)")
     note "DEGRADED: $label (component stopped before exposure)" >&2
     return 1
+  fi
+}
+
+disable_managed_exposure() {
+  local label=$1 path=$2
+  if [[ -e "$path" || -L "$path" ]]; then
+    if rm -f "$path"; then
+      note "DEGRADED: removed untrusted installer-owned $label exposure: $path" >&2
+    else
+      DEGRADED+=("$label: could not disable installer-owned exposure: $path")
+    fi
   fi
 }
 
@@ -158,16 +170,20 @@ install_nuclei() {
 
 install_sqlmap() {
   local sqlmap_dir="$LOCAL_OPT/sqlmap"
-  if command -v sqlmap >/dev/null 2>&1 || [[ -f "$sqlmap_dir/sqlmap.py" ]]; then
+  local existing
+  existing=$(command -v sqlmap 2>/dev/null || true)
+  if [[ -n "$existing" && "$existing" != "$LOCAL_BIN/sqlmap" ]]; then
     return 0
   fi
   try_run "sqlmap directory" mkdir -p "$LOCAL_OPT" "$LOCAL_BIN"
   try_run "official sqlmap checkout" git clone https://github.com/sqlmapproject/sqlmap.git "$sqlmap_dir"
   if [[ ! -d "$sqlmap_dir/.git" ]]; then
     DEGRADED+=("sqlmap: official checkout did not create a Git repository")
+    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap"
     return 0
   fi
   if ! pin_revision "pinned sqlmap revision" "$sqlmap_dir" "$SQLMAP_REVISION"; then
+    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap"
     return 0
   fi
   if "$DRY_RUN"; then
@@ -182,7 +198,9 @@ install_sqlmap() {
 
 install_radare2() {
   local r2_dir="$LOCAL_OPT/radare2"
-  if command -v radare2 >/dev/null 2>&1 || [[ -x "$LOCAL_BIN/radare2" ]]; then
+  local existing
+  existing=$(command -v radare2 2>/dev/null || true)
+  if [[ -n "$existing" && "$existing" != "$LOCAL_BIN/radare2" ]]; then
     return 0
   fi
   try_run "radare2 directory" mkdir -p "$LOCAL_OPT"
@@ -191,13 +209,15 @@ install_radare2() {
   fi
   if [[ ! -d "$r2_dir/.git" ]]; then
     DEGRADED+=("radare2: official checkout did not create a Git repository")
+    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2"
     return 0
   fi
   if ! pin_revision "pinned radare2 revision" "$r2_dir" "$R2_REVISION"; then
+    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2"
     return 0
   fi
   if [[ -f "$r2_dir/configure" ]]; then
-    try_run "user-local radare2 build" bash -c 'cd "$1" && ./configure --prefix="$2" && make -j"$(nproc)" && make install' _ "$r2_dir" /home/normalone/.local
+    try_run "user-local radare2 build" bash -c 'cd "$1" && ./configure --prefix="$2" && make -j"$(nproc)" && make install' _ "$r2_dir" "$LOCAL_PREFIX"
   elif ! "$DRY_RUN"; then
     DEGRADED+=("radare2: official source was unavailable at $r2_dir")
   fi

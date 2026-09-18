@@ -249,6 +249,62 @@ class ToolScriptTests(unittest.TestCase):
             self.assertIn("pinned radare2 revision", result.stderr)
             self.assertFalse(marker.exists())
 
+    def test_sqlmap_rerun_disables_a_stale_managed_wrapper_when_pin_validation_fails(self) -> None:
+        """A second run must not trust an existing installer-owned sqlmap wrapper."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            local_root = temporary_path / "local"
+            local_bin = local_root / "bin"
+            local_bin.mkdir(parents=True)
+            source = local_root / "opt" / "sqlmap"
+            source.mkdir(parents=True)
+            (source / ".git").mkdir()
+            (source / "sqlmap.py").write_text("stale source\n", encoding="utf-8")
+            self.write_executable(local_bin / "sqlmap", "echo stale sqlmap")
+            fake_bin = temporary_path / "fake-bin"
+            fake_bin.mkdir()
+            self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
+            environment = {
+                "PATH": f"{local_bin}:{fake_bin}:/usr/bin:/bin",
+                "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
+                "CTF_TOOLS_LOCAL_BIN": str(local_bin),
+                "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+            }
+            for _ in range(2):
+                result = self.run_command("bash", str(INSTALLER), "--component", "sqlmap", env=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("pinned sqlmap revision", result.stderr)
+                self.assertFalse((local_bin / "sqlmap").exists())
+
+    def test_radare2_rerun_disables_a_stale_managed_binary_when_pin_validation_fails(self) -> None:
+        """A second run must not build or retain an installer-owned unpinned radare2."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            local_root = temporary_path / "local"
+            local_bin = local_root / "bin"
+            local_bin.mkdir(parents=True)
+            source = local_root / "opt" / "radare2"
+            source.mkdir(parents=True)
+            (source / ".git").mkdir()
+            marker = temporary_path / "build-ran"
+            self.write_executable(source / "configure", f"touch '{marker}'")
+            self.write_executable(local_bin / "radare2", "echo stale radare2")
+            fake_bin = temporary_path / "fake-bin"
+            fake_bin.mkdir()
+            self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
+            environment = {
+                "PATH": f"{local_bin}:{fake_bin}:/usr/bin:/bin",
+                "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
+                "CTF_TOOLS_LOCAL_BIN": str(local_bin),
+                "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+            }
+            for _ in range(2):
+                result = self.run_command("bash", str(INSTALLER), "--component", "radare2", env=environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("pinned radare2 revision", result.stderr)
+                self.assertFalse((local_bin / "radare2").exists())
+                self.assertFalse(marker.exists())
+
     def test_skill_metadata_and_common_initializer_create_category_run_layouts(self) -> None:
         """Skill metadata and the documented common initializer agree on category workspaces."""
         for category in ("pwn", "web", "rev"):
