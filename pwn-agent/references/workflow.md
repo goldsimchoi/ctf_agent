@@ -30,12 +30,28 @@ The Lead Solver owns the canonical exploit and final decision.
    and publish its immutable attestation before verification:
 
    ```text
-   python3 <skill>/scripts/publish_capture.py --workspace <workspace> \
-     --capture-id run-1 --source-target local:chall --output transcripts/run-1.recv.bin \
-     --sent transcripts/run-1.sent.bin
-   python3 <skill>/scripts/verify_flag.py --workspace <workspace> \
-     --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin \
-     --attestation artifacts/captures/run-1.json
+   WORKSPACE='/absolute/path/to/session'
+   SOURCE_TARGET="$(python3 -c '
+import json, pathlib, re, sys
+workspace = pathlib.Path(sys.argv[1]).resolve(strict=True)
+session = json.loads((workspace / "session.json").read_text(encoding="utf-8"))
+manifest = (workspace / "challenge.resolved.yaml").read_text(encoding="utf-8")
+match = re.search(r"^\s*binary\s*:\s*([^#\n]+)", manifest, re.MULTILINE)
+if match is None:
+    raise SystemExit("resolved manifest has no binary")
+binary = pathlib.Path(match.group(1).strip().strip("'\\\""))
+if binary.is_absolute() or ".." in binary.parts:
+    raise SystemExit("resolved manifest binary is not challenge-relative")
+print("local:" + str((pathlib.Path(session["challenge"]) / binary).resolve(strict=True)))
+' "$WORKSPACE")"
+   python3 <skill>/scripts/publish_capture.py --workspace "$WORKSPACE" \
+     --capture-id run-1 --source-target "$SOURCE_TARGET" \
+     --output "$WORKSPACE/transcripts/run-1.recv.bin" \
+     --sent "$WORKSPACE/transcripts/run-1.sent.bin"
+   python3 <skill>/scripts/verify_flag.py --workspace "$WORKSPACE" \
+     --output "$WORKSPACE/transcripts/run-1.recv.bin" \
+     --sent "$WORKSPACE/transcripts/run-1.sent.bin" \
+     --attestation "$WORKSPACE/artifacts/captures/run-1.json"
    ```
 
    Race mode reports the first attested non-echoed flag. Use strict verification
