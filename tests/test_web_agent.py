@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
@@ -142,6 +143,18 @@ class EncodingHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/bomb":
             body = gzip.compress(b"A" * (4 * 1024 * 1024 + 1), mtime=0)
             encoding = "gzip"
+        elif self.path == "/deflate":
+            body = zlib.compress(b"FLAG{deflate_target}")
+            encoding = "deflate"
+        elif self.path == "/malformed-gzip":
+            body = b"not-a-gzip-stream"
+            encoding = "gzip"
+        elif self.path == "/malformed-deflate":
+            body = b"not-a-deflate-stream"
+            encoding = "deflate"
+        elif self.path == "/trailing":
+            body = gzip.compress(b"FLAG{trailing_target}", mtime=0) + b"trailing"
+            encoding = "gzip"
         else:
             body = b"FLAG{unsupported_encoding}"
             encoding = "br"
@@ -157,6 +170,13 @@ class EncodingHandler(http.server.BaseHTTPRequestHandler):
 
 class BarrierHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
+        name = urlsplit(self.path).path.strip("/")
+        self.server.order.append(name)
+        if name == "first":
+            self.server.first_seen.set()
+            self.server.release.wait(timeout=5)
+        else:
+            self.server.second_seen.set()
         body = b"ok"
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
@@ -447,7 +467,37 @@ class WebAgentTests(unittest.TestCase):
                 provenance = json.loads(Path(captured["provenance"]).read_text(encoding="utf-8"))
                 self.assertIsNone(captured["attestation"])
                 self.assertNotIn("capture", provenance)
-                self.assertEqual(self.verify(workspace, "--output", captured["response_entity_body"]).returncode, 2)
+                rejected = self.verify(workspace, "--output", captured["response_entity_body"])
+                self.assertEqual(rejected.returncode, 2)
+                self.assertEqual(json.loads(rejected.stdout)["status"], "error")
+
+    def test_deflate_verifies_but_malformed_and_trailing_encodings_are_unattested(self) -> None:
+        with local_server(EncodingHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-codecs", origin)
+            self.init_web_state(workspace)
+            valid = json.loads(self.request(
+                workspace, origin + "/deflate", "--progress", "new fact: deflate target"
+            ).stdout)
+            malformed_gzip = json.loads(self.request(
+                workspace, origin + "/malformed-gzip", "--progress", "new fact: bad gzip"
+            ).stdout)
+            malformed_deflate = json.loads(self.request(
+                workspace, origin + "/malformed-deflate", "--progress", "new fact: bad deflate"
+            ).stdout)
+            trailing = json.loads(self.request(
+                workspace, origin + "/trailing", "--progress", "new fact: trailing data"
+            ).stdout)
+
+            verified = self.verify(workspace, "--output", valid["response_entity_body"])
+            self.assertEqual(verified.returncode, 0, verified.stderr)
+            self.assertEqual(json.loads(verified.stdout)["status"], "verified")
+            for captured in (malformed_gzip, malformed_deflate, trailing):
+                provenance = json.loads(Path(captured["provenance"]).read_text(encoding="utf-8"))
+                self.assertIsNone(captured["attestation"])
+                self.assertNotIn("capture", provenance)
+                rejected = self.verify(workspace, "--output", captured["response_entity_body"])
+                self.assertEqual(rejected.returncode, 2)
+                self.assertEqual(json.loads(rejected.stdout)["status"], "error")
 
     def test_web_validation_rejects_forged_capture_cross_links(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
@@ -473,19 +523,33 @@ class WebAgentTests(unittest.TestCase):
 
     def test_same_session_concurrent_requests_preserve_both_history_entries(self) -> None:
         with local_server(BarrierHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.order = []
+            server.first_seen = threading.Event()
+            server.second_seen = threading.Event()
+            server.release = threading.Event()
             workspace = self.make_workspace(Path(temp), "web-concurrent", origin)
             self.init_web_state(workspace)
             with ThreadPoolExecutor(max_workers=2) as pool:
-                results = list(pool.map(
-                    lambda suffix: self.request(
-                        workspace, origin + "/" + suffix, "--progress", f"new fact: {suffix}"
-                    ),
-                    ("one", "two"),
-                ))
+                first = pool.submit(self.request, workspace, origin + "/first?input=before", "--progress", "new fact: first")
+                self.assertTrue(server.first_seen.wait(timeout=5))
+                second = pool.submit(self.request, workspace, origin + "/second", "--progress", "new fact: second")
+                try:
+                    self.assertFalse(server.second_seen.wait(timeout=0.25))
+                    self.assertEqual(server.order, ["first"])
+                    server.release.set()
+                    first_result = first.result(timeout=10)
+                    second_result = second.result(timeout=10)
+                finally:
+                    server.release.set()
 
-            self.assertTrue(all(result.returncode == 0 for result in results))
+            self.assertEqual(first_result.returncode, 0, first_result.stderr)
+            self.assertEqual(second_result.returncode, 0, second_result.stderr)
+            self.assertEqual(server.order, ["first", "second"])
             history = json.loads((workspace / "web" / "history.json").read_text(encoding="utf-8"))
             self.assertEqual(len(history["requests"]), 2)
+            second_capture = json.loads(second_result.stdout)
+            second_provenance = json.loads(Path(second_capture["provenance"]).read_text(encoding="utf-8"))
+            self.assertIn(b"query:input=before", Path(second_provenance["capture"]["sent"]).read_bytes())
 
     def test_request_rejects_target_origin_and_non_web_session_before_traffic(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
