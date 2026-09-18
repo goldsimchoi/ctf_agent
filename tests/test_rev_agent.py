@@ -17,6 +17,7 @@ SCRIPTS = SKILL_DIR / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from init_rev_state import init_rev_state  # noqa: E402
+import record_clue as rev_state  # noqa: E402
 from record_clue import (  # noqa: E402
     record_clue,
     record_contradiction,
@@ -131,6 +132,48 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(solver.returncode, 2)
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
             self.assertEqual(list(outside.iterdir()), [sentinel])
+
+    def test_held_rev_descriptor_keeps_ledger_operation_on_original_directory_after_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-held-directory")
+            init_rev_state(workspace)
+            rev = workspace / "rev"
+            with rev_state._lock(workspace, ".clues.lock") as (_rev, directory):
+                moved = workspace / "rev-held"
+                rev.rename(moved)
+                rev.mkdir()
+                attacker = {"schema_version": 1, "clues": [{"id": "attacker"}]}
+                (rev / "clues.json").write_text(json.dumps(attacker), encoding="utf-8")
+                sentinel = rev / "sentinel"
+                sentinel.write_text("unchanged", encoding="utf-8")
+
+                payload, entries = rev_state._load(directory, "clues.json", "clues")
+                entries.append({"id": "clue-0001"})
+                rev_state._atomic_json(directory, "clues.json", payload)
+
+            self.assertEqual(json.loads((moved / "clues.json").read_text())["clues"], [{"id": "clue-0001"}])
+            self.assertEqual(json.loads((rev / "clues.json").read_text()), attacker)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+
+    def test_wal_publish_failure_leaves_no_partial_record_or_overwrites_good_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-wal-publish")
+            init_rev_state(workspace)
+            journal = workspace / "rev" / ".state.transaction.json"
+            with rev_state._lock(workspace, ".state.lock") as (_rev, directory):
+                with self.assertRaises(ValueError):
+                    rev_state._write_new_json(directory, journal.name, {"bad": {"not-json"}})
+                self.assertFalse(journal.exists())
+                good = {"schema_version": 1, "hypotheses": {"schema_version": 1, "hypotheses": []}, "contradictions": {"schema_version": 1, "contradictions": []}}
+                rev_state._write_new_json(directory, journal.name, good)
+                before = journal.read_bytes()
+                with self.assertRaises(ValueError):
+                    rev_state._write_new_json(directory, journal.name, {"bad": {"still-not-json"}})
+                self.assertEqual(journal.read_bytes(), before)
+            recovered = record_hypothesis(workspace, "recovered", "break at recovered")
+            self.assertEqual(recovered["status"], "active")
+            self.assertFalse(journal.exists())
 
     def test_clue_requires_next_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

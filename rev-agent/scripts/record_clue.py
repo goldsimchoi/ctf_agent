@@ -10,6 +10,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,7 +21,7 @@ from init_rev_state import RevStateError, init_rev_state, rev_directory, session
 
 COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "ctf-common" / "scripts"
 sys.path.insert(0, str(COMMON_SCRIPTS))
-from ctf_workspace import InvalidInput, _open_directory_nofollow, _read_regular_under  # noqa: E402
+from ctf_workspace import MAX_ARTIFACT_BYTES, InvalidInput, _open_directory_nofollow  # noqa: E402
 
 
 @contextmanager
@@ -54,8 +55,46 @@ def _json_bytes(payload: dict[str, Any]) -> bytes:
     return (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
 
+def _read_json(directory: int, name: str, description: str) -> dict[str, Any]:
+    """Read one bounded regular JSON file through the already-held rev FD."""
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RevStateError(f"{description} is not a regular file")
+        if metadata.st_size > MAX_ARTIFACT_BYTES:
+            raise RevStateError(f"{description} exceeds the artifact limit")
+        chunks: list[bytes] = []
+        total = 0
+        while block := os.read(descriptor, 1024 * 1024):
+            total += len(block)
+            if total > MAX_ARTIFACT_BYTES:
+                raise RevStateError(f"{description} exceeds the artifact limit")
+            chunks.append(block)
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RevStateError(f"invalid {description}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if not isinstance(payload, dict):
+        raise RevStateError(f"invalid {description}")
+    return payload
+
+
+def _write_all(descriptor: int, content: bytes) -> None:
+    pending = memoryview(content)
+    while pending:
+        written = os.write(descriptor, pending)
+        if written <= 0:
+            raise OSError("short reversing state write")
+        pending = pending[written:]
+
+
 def _atomic_json(directory: int, name: str, payload: dict[str, Any]) -> None:
     """Atomically replace one ledger through an already-held no-follow directory FD."""
+    content = _json_bytes(payload)
     temporary = f".{name}.{secrets.token_hex(8)}.tmp"
     try:
         descriptor = os.open(
@@ -63,7 +102,7 @@ def _atomic_json(directory: int, name: str, payload: dict[str, Any]) -> None:
             dir_fd=directory,
         )
         with os.fdopen(descriptor, "wb") as stream:
-            stream.write(_json_bytes(payload))
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
@@ -80,19 +119,35 @@ def _atomic_json(directory: int, name: str, payload: dict[str, Any]) -> None:
 
 
 def _write_new_json(directory: int, name: str, payload: dict[str, Any]) -> None:
-    """Create a transaction record through the validated directory descriptor."""
+    """Atomically publish a new transaction record without replacing one."""
+    try:
+        content = _json_bytes(payload)
+    except (TypeError, ValueError) as exc:
+        raise RevStateError("invalid reversing transaction payload") from exc
+    temporary = f".{name}.{secrets.token_hex(8)}.tmp"
+    descriptor: int | None = None
     try:
         descriptor = os.open(
-            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
             dir_fd=directory,
         )
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(_json_bytes(payload))
-            stream.flush()
-            os.fsync(stream.fileno())
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.link(temporary, name, src_dir_fd=directory, dst_dir_fd=directory, follow_symlinks=False)
         os.fsync(directory)
     except OSError as exc:
         raise RevStateError("unsafe reversing transaction write") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _remove(directory: int, name: str) -> None:
@@ -166,33 +221,30 @@ def _validate_transaction_snapshots(hypotheses: object, contradictions: object) 
             raise ValueError("inconsistent transaction contradiction link")
 
 
-def _load(workspace: Path, rev: Path, name: str, key: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    path = rev / name
+def _load(directory: int, name: str, key: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     try:
-        payload = json.loads(_read_regular_under(workspace, path, "reversing state").data.decode("utf-8"))
+        payload = _read_json(directory, name, "reversing state")
         entries = payload[key]
-    except (InvalidInput, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RevStateError(f"invalid reversing state: {path}") from exc
+    except (RevStateError, KeyError, TypeError) as exc:
+        raise RevStateError(f"invalid reversing state: {name}") from exc
     if not isinstance(payload, dict) or not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
-        raise RevStateError(f"invalid reversing state: {path}")
+        raise RevStateError(f"invalid reversing state: {name}")
     return payload, entries
 
 
-def _recover_transaction(workspace: Path, rev: Path, directory: int) -> None:
+def _recover_transaction(directory: int) -> None:
     name = ".state.transaction.json"
     if not _transaction_exists(directory, name):
         return
     try:
-        transaction = json.loads(
-            _read_regular_under(workspace, rev / name, "reversing transaction").data.decode("utf-8")
-        )
+        transaction = _read_json(directory, name, "reversing transaction")
         hypotheses = transaction["hypotheses"]
         contradictions = transaction["contradictions"]
         if set(transaction) != {"schema_version", "hypotheses", "contradictions"} or transaction.get("schema_version") != 1:
             raise ValueError
         _validate_transaction_snapshots(hypotheses, contradictions)
-    except (InvalidInput, UnicodeDecodeError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RevStateError(f"invalid pending reversing transaction: {rev / name}") from exc
+    except (RevStateError, ValueError, KeyError, TypeError) as exc:
+        raise RevStateError("invalid pending reversing transaction") from exc
     _atomic_json(directory, "hypotheses.json", hypotheses)
     _atomic_json(directory, "contradictions.json", contradictions)
     _remove(directory, name)
@@ -242,8 +294,8 @@ def record_clue(
     evidence = _text(evidence, "evidence")
     summary = _text(summary, "summary")
     action = _text(next_action or "", "next action")
-    with _lock(workspace, ".clues.lock") as (rev, directory):
-        payload, entries = _load(workspace, rev, "clues.json", "clues")
+    with _lock(workspace, ".clues.lock") as (_rev, directory):
+        payload, entries = _load(directory, "clues.json", "clues")
         entry = {
             "id": f"clue-{len(entries) + 1:04d}",
             "evidence": evidence,
@@ -265,10 +317,10 @@ def record_hypothesis(workspace: Path, statement: str, falsifying_test: str) -> 
     init_rev_state(workspace)
     statement = _text(statement, "hypothesis")
     falsifying_test = _text(falsifying_test, "falsifying test")
-    with _lock(workspace, ".state.lock") as (rev, directory):
-        _recover_transaction(workspace, rev, directory)
-        payload, entries = _load(workspace, rev, "hypotheses.json", "hypotheses")
-        contradictions, _ = _load(workspace, rev, "contradictions.json", "contradictions")
+    with _lock(workspace, ".state.lock") as (_rev, directory):
+        _recover_transaction(directory)
+        payload, entries = _load(directory, "hypotheses.json", "hypotheses")
+        contradictions, _ = _load(directory, "contradictions.json", "contradictions")
         entry = {
             "id": f"hypothesis-{len(entries) + 1:04d}",
             "statement": statement,
@@ -298,10 +350,10 @@ def record_experiment(
     hypothesis_id = _text(hypothesis_id, "hypothesis id")
     evidence = _text(evidence, "evidence")
     result = _text(result, "result")
-    with _lock(workspace, ".state.lock") as (rev, directory):
-        _recover_transaction(workspace, rev, directory)
-        payload, entries = _load(workspace, rev, "hypotheses.json", "hypotheses")
-        contradictions, _ = _load(workspace, rev, "contradictions.json", "contradictions")
+    with _lock(workspace, ".state.lock") as (_rev, directory):
+        _recover_transaction(directory)
+        payload, entries = _load(directory, "hypotheses.json", "hypotheses")
+        contradictions, _ = _load(directory, "contradictions.json", "contradictions")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:
             raise RevStateError(f"unknown hypothesis: {hypothesis_id}")
@@ -334,13 +386,13 @@ def record_contradiction(
     hypothesis_id = _text(hypothesis_id, "hypothesis id")
     evidence = _text(evidence, "evidence")
     summary = _text(summary, "contradiction summary")
-    with _lock(workspace, ".state.lock") as (rev, directory):
-        _recover_transaction(workspace, rev, directory)
-        hypotheses, entries = _load(workspace, rev, "hypotheses.json", "hypotheses")
+    with _lock(workspace, ".state.lock") as (_rev, directory):
+        _recover_transaction(directory)
+        hypotheses, entries = _load(directory, "hypotheses.json", "hypotheses")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:
             raise RevStateError(f"unknown hypothesis: {hypothesis_id}")
-        contradictions, records = _load(workspace, rev, "contradictions.json", "contradictions")
+        contradictions, records = _load(directory, "contradictions.json", "contradictions")
         record = {
             "id": f"contradiction-{len(records) + 1:04d}",
             "hypothesis_id": hypothesis_id,
