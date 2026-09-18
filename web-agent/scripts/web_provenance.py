@@ -158,16 +158,21 @@ def prepared_sent_evidence(prepared_bytes: bytes) -> bytes:
 
 
 def sent_history(workspace: Path, prepared_paths: list[Path]) -> bytes | None:
+    boundary = b"\n\n--- request boundary ---\n\n"
     chunks: list[bytes] = []
+    total = 0
     try:
         for path in prepared_paths:
             snapshot = _read_regular_under(workspace, path, "prepared request evidence")
-            chunks.append(prepared_sent_evidence(snapshot.data))
-            if sum(len(item) for item in chunks) > MAX_ARTIFACT_BYTES:
+            evidence = prepared_sent_evidence(snapshot.data)
+            addition = len(evidence) + (len(boundary) if chunks else 0)
+            if total + addition > MAX_ARTIFACT_BYTES:
                 return None
+            chunks.append(evidence)
+            total += addition
     except (InvalidInput, WebStateError):
         return None
-    return b"\n\n--- request boundary ---\n\n".join(chunks)
+    return boundary.join(chunks)
 
 
 def validate_response_provenance(workspace: Path, evidence: Path) -> dict:

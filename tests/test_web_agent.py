@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import http.server
 import os
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
@@ -23,6 +24,9 @@ SKILL_DIR = REPO_ROOT / "web-agent"
 COMMON_SCRIPTS = REPO_ROOT / "ctf-common" / "scripts"
 REQUEST = SKILL_DIR / "assets" / "request.py"
 VERIFY_WEB_FLAG = SKILL_DIR / "scripts" / "verify_web_flag.py"
+sys.path.insert(0, str(SKILL_DIR / "scripts"))
+from web_provenance import prepared_sent_evidence, sent_history  # noqa: E402
+from ctf_workspace import MAX_ARTIFACT_BYTES  # noqa: E402
 GZIP_BODY = gzip.compress(b"FLAG{compressed_target_result}", mtime=0)
 READY_EXEC = """
 import os
@@ -299,6 +303,28 @@ class ChainHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class SameUrlChainHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        self.server.same_url_hits += 1
+        if self.server.same_url_hits == 1:
+            body = b"FLAG{same_url_chain}"
+            self.send_response(302)
+            self.send_header("Location", "/same")
+        elif self.server.same_url_hits == 2:
+            body = b"FLAG{same_url_chain}"
+            self.send_response(200)
+        else:
+            body = b"no candidate"
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
 @contextmanager
 def local_server(handler: type[http.server.BaseHTTPRequestHandler]):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -536,17 +562,76 @@ class WebAgentTests(unittest.TestCase):
             self.assertEqual(rejected.returncode, 2)
             self.assertEqual(json.loads(rejected.stdout)["status"], "unverified")
 
-    def test_strict_rejects_duplicate_redirect_chain_with_unrelated_output(self) -> None:
-        with local_server(ChainHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+    def test_sent_history_counts_boundaries_and_leaves_overflow_capture_unattested(self) -> None:
+        with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.external_url = origin
+            workspace = self.make_workspace(Path(temp), "web-history-bound", origin)
+            self.init_web_state(workspace)
+            requests_dir = workspace / "web" / "requests"
+
+            def prepared(body_size: int, padding: int = 0) -> bytes:
+                return json.dumps({
+                    "method": "POST", "url": origin + "/history", "headers": [],
+                    "body_base64": base64.b64encode(b"x" * body_size).decode("ascii"),
+                    "padding": "p" * padding, "wire_exact": False,
+                }, separators=(",", ":")).encode("utf-8")
+
+            second = prepared(0)
+            second_evidence = prepared_sent_evidence(second)
+            target = MAX_ARTIFACT_BYTES - len(second_evidence)
+            low, high, best = 0, target, prepared(0)
+            while low <= high:
+                middle = (low + high) // 2
+                candidate = prepared(middle)
+                try:
+                    evidence = prepared_sent_evidence(candidate)
+                except ValueError:
+                    high = middle - 1
+                    continue
+                if len(evidence) <= target:
+                    best = candidate
+                    low = middle + 1
+                else:
+                    high = middle - 1
+            padding = target - len(prepared_sent_evidence(best))
+            first = json.loads(best)
+            first["padding"] += "p" * padding
+            first = json.dumps(first, separators=(",", ":")).encode("utf-8")
+            self.assertEqual(len(prepared_sent_evidence(first)) + len(second_evidence), MAX_ARTIFACT_BYTES)
+            first_path = requests_dir / "near-bound.prepared.json"
+            second_path = requests_dir / "second.prepared.json"
+            first_path.write_bytes(first)
+            second_path.write_bytes(second)
+            self.assertEqual(len(sent_history(workspace, [first_path])), MAX_ARTIFACT_BYTES - len(second_evidence))
+            self.assertTrue(sent_history(workspace, [first_path, second_path]) is None)
+
+            (workspace / "web" / "history.json").write_text(json.dumps({
+                "schema_version": 1, "requests": [{"request": str(first_path), "complete": True}],
+            }), encoding="utf-8")
+            captured = json.loads(self.request(
+                workspace, origin + "/gzip", "--progress", "new fact: boundary history capture"
+            ).stdout)
+            provenance = json.loads(Path(captured["provenance"]).read_text(encoding="utf-8"))
+            self.assertIsNone(captured["attestation"])
+            self.assertNotIn("capture", provenance)
+            rejected = self.verify(workspace, "--output", captured["response_entity_body"])
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(json.loads(rejected.stdout)["status"], "error")
+
+    def test_strict_rejects_duplicate_same_url_request_chain(self) -> None:
+        with local_server(SameUrlChainHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.same_url_hits = 0
             workspace = self.make_workspace(Path(temp), "web-strict-chain", origin)
             self.init_web_state(workspace)
-            chain = json.loads(self.request(workspace, origin + "/start", "--progress", "new fact: redirect chain").stdout)
-            unrelated = json.loads(self.request(workspace, origin + "/other", "--progress", "new fact: unrelated output").stdout)
+            chain = json.loads(self.request(workspace, origin + "/same", "--progress", "new fact: same URL redirect chain").stdout)
+            unrelated = json.loads(self.request(workspace, origin + "/same", "--progress", "new fact: same URL unrelated output").stdout)
             bodies = json.loads(Path(chain["summary"]).read_text(encoding="utf-8"))["response_entity_bodies"]
             rejected = self.verify(workspace, "--strict", "--output", bodies[0], "--output", bodies[1], "--output", unrelated["response_entity_body"])
 
             self.assertEqual(rejected.returncode, 2)
-            self.assertEqual(json.loads(rejected.stdout)["status"], "error")
+            payload = json.loads(rejected.stdout)
+            self.assertEqual(payload["status"], "error")
+            self.assertEqual(payload["error"], "strict mode requires two distinct authorized web requests")
 
     def test_web_state_rejects_symlinked_root_and_swapped_write_or_lock_targets(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
