@@ -146,6 +146,28 @@ class ToolScriptTests(unittest.TestCase):
         self.assertEqual(report["mcp"]["gdb"]["status"], "available")
         self.assertEqual(report["mcp"]["gdb"]["path"], str(executable))
 
+    def test_checker_degrades_a_corrupt_managed_python_without_losing_json(self) -> None:
+        """A present but unexecutable venv Python must not crash the capability report."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            venv_python = temporary_path / "CTF" / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            venv_python.write_text("this is not an executable\n", encoding="utf-8")
+            venv_python.chmod(0o755)
+            config = temporary_path / "config.toml"
+            config.write_text("", encoding="utf-8")
+            report = self.checker_report(
+                {
+                    "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
+                    "CTF_TOOLS_CONFIG": str(config),
+                    "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
+                    "CTF_TOOLS_PLAYWRIGHT_CACHE": str(temporary_path / "missing-cache"),
+                }
+            )
+        self.assertEqual(report["venv"]["status"], "degraded")
+        self.assertIn("probe OS error", report["venv"]["reason"])
+        self.assertEqual(report["python"]["angr"]["status"], "degraded")
+
     def write_executable(self, path: Path, body: str) -> None:
         path.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
         path.chmod(0o755)

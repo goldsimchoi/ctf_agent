@@ -53,7 +53,7 @@ def available(path, version):
 def run_probe(command, pattern, timeout=10, allow_usage=False):
     try:
         result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-    except FileNotFoundError: return None, f"probe command is missing: {command[0]}"
+    except OSError as error: return None, f"probe OS error ({error.strerror or error.__class__.__name__}): {command[0]}"
     except subprocess.TimeoutExpired: return None, f"probe timed out after {timeout}s: {' '.join(command)}"
     output = ANSI.sub("", result.stdout or "").strip()
     if result.returncode: return None, f"probe exited {result.returncode}: {' '.join(command)}"
