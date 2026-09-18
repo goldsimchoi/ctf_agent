@@ -367,6 +367,40 @@ class WebAgentTests(unittest.TestCase):
             self.assertEqual(self.verify(workspace, "--output", from_url["response_entity_body"]).returncode, 2)
             self.assertEqual(self.verify(workspace, "--output", from_form["response_entity_body"]).returncode, 2)
 
+    def test_web_verifier_rejects_echo_in_second_repeated_query_and_form_value(self) -> None:
+        with local_server(EchoHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-second-echo", origin)
+            self.init_web_state(workspace)
+            from_query = json.loads(self.request(
+                workspace,
+                origin + "/echo?one=benign&one=FLAG%7Bsecond%7D",
+                "--progress", "new fact: second query echo",
+            ).stdout)
+            from_form = json.loads(self.request(
+                workspace,
+                origin + "/echo",
+                "--method", "POST",
+                "--header", "Content-Type=application/x-www-form-urlencoded",
+                "--data", "one=benign&one=FLAG%7Bsecond%7D",
+                "--progress", "new fact: second form echo",
+            ).stdout)
+
+            self.assertEqual(self.verify(workspace, "--output", from_query["response_entity_body"]).returncode, 2)
+            self.assertEqual(self.verify(workspace, "--output", from_form["response_entity_body"]).returncode, 2)
+
+    def test_web_verifier_rejects_plus_decoded_words_in_reflected_flag(self) -> None:
+        with local_server(EchoHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-plus-echo", origin)
+            self.init_web_state(workspace)
+            response = json.loads(self.request(
+                workspace,
+                origin + "/echo?one=benign&one=FLAG%7Btwo+words%7D",
+                "--progress", "new fact: plus decoded echo",
+            ).stdout)
+
+            verified = self.verify(workspace, "--output", response["response_entity_body"])
+            self.assertEqual(verified.returncode, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
