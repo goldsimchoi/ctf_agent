@@ -1,43 +1,26 @@
 # State and flag verification
 
-Keep `state.json` small and machine-readable.
+The common initializer creates session-local `session.json`, `state.json`,
+`challenge.resolved.yaml`, `notes.md`, `artifacts/`, `logs/`, and `transcripts/`.
+The helper owns `state.json`; record attempts through its CLI. Keep notes compact:
+facts with evidence paths, falsifiable hypotheses, experiments, capabilities, and
+the current strategy. Publish only immutable evidence from the current session.
 
-- **Fact:** directly observed, with an artifact or command reference.
-- **Hypothesis:** falsifiable claim, confidence, and next discriminating test.
-- **Experiment:** command or action, expected observation, actual result, and
-  artifact path.
-- **Capability:** concrete primitive such as controlled RIP, arbitrary read,
-  libc base, arbitrary write, stack pivot, shell, or flag-file read.
-- **Strategy:** the one currently selected exploit path and its blockers.
-
-Demote or remove contradicted hypotheses. Never promote a decompiler guess,
-offset, address, or libc match to fact without evidence.
-
-## Binary-safe evidence
-
-Save bytes sent to the process separately from bytes received. Do not rely only
-on terminal rendering: NUL bytes, ANSI control sequences, and decoding errors can
-hide or invent apparent output. Hash raw transcripts.
-
-## Strict success rule
-
-A candidate flag is verified only when:
-
-1. the same byte sequence appears in output from at least two fresh sessions;
-2. it matches a manifest-supplied or explicit flag pattern;
-3. it was not present in bytes sent by the exploit or user;
-4. each transcript is saved and attributable to the authorized target.
-
-Run:
+Save bytes sent separately from bytes received. Race mode accepts one flag matching
+the configured/default pattern from authorized target output when it is not in sent
+bytes:
 
 ```text
-python scripts/verify_flag.py \
-  --output transcripts/run1.recv.bin \
-  --output transcripts/run2.recv.bin \
-  --sent transcripts/sent.bin \
-  --pattern 'FLAG\{[^}\r\n]+\}' \
-  --result flag-result.json
+python3 scripts/verify_flag.py --workspace <workspace> \
+  --output transcripts/target.recv.bin --sent transcripts/target.sent.bin
 ```
 
-Exit code 0 means verified. Exit code 2 means unverified; inspect `reason`. Do not
-report a flag as final unless this check or an equivalent stricter check passes.
+For `mode: strict`, require two clean outputs:
+
+```text
+python3 scripts/verify_flag.py --workspace <workspace> \
+  --output transcripts/run1.recv.bin --output transcripts/run2.recv.bin --strict
+```
+
+Both modes reject echoes. Exit code 0 is verified; exit code 2 is unverified with
+a JSON `reason`.

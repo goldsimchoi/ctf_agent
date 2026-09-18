@@ -20,51 +20,28 @@ def run_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 class PwnAgentScriptTests(unittest.TestCase):
-    def test_init_run_accepts_direct_binary_without_manifest(self) -> None:
+    def make_challenge(self, root: Path) -> Path:
+        challenge = root / "challenges" / "ret2win"
+        challenge.mkdir(parents=True)
+        (challenge / "challenge.yaml").write_text(
+            "id: ret2win\nwall_time_seconds: 900\n",
+            encoding="utf-8",
+        )
+        (challenge / "chall").write_bytes(b"\x7fELFfixture")
+        return challenge
+
+    def test_init_run_creates_a_common_pwn_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            binary = root / "babyrop"
-            binary.write_bytes(b"\x7fELFfixture")
-
-            result = run_script(
-                "init_run.py",
-                str(binary),
-                "--runs-root",
-                str(root / "runs"),
-                "--run-id",
-                "direct-run",
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            workspace = Path(json.loads(result.stdout)["workspace"])
-            self.assertEqual(workspace.name, "babyrop")
-            resolved = (
-                workspace / "challenge.resolved.yaml"
-            ).read_text(encoding="utf-8")
-            self.assertIn("id: babyrop", resolved)
-            self.assertIn(str(binary.resolve()), resolved)
-            self.assertEqual(binary.read_bytes(), b"\x7fELFfixture")
-
-    def test_init_run_creates_isolated_workspace(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            challenge = root / "challenges" / "ret2win"
-            input_dir = challenge / "input"
-            input_dir.mkdir(parents=True)
-            binary = input_dir / "chall"
-            binary.write_bytes(b"\x7fELFfixture")
-            (challenge / "challenge.yaml").write_text(
-                "id: ret2win\nbinary: input/chall\n",
-                encoding="utf-8",
-            )
+            event_root = Path(temp) / "event"
+            challenge = self.make_challenge(event_root)
 
             result = run_script(
                 "init_run.py",
                 str(challenge),
-                "--runs-root",
-                str(root / "runs"),
-                "--run-id",
-                "test-run",
+                "--event-root",
+                str(event_root),
+                "--session-id",
+                "pwn-test",
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -72,72 +49,56 @@ class PwnAgentScriptTests(unittest.TestCase):
             workspace = Path(payload["workspace"])
             self.assertEqual(
                 workspace,
-                root / "runs" / "test-run" / "ret2win",
+                event_root
+                / "runs"
+                / "pwn"
+                / f"ret2win-{payload['fingerprint'][:12]}"
+                / "sessions"
+                / "pwn-test",
             )
-            self.assertTrue((workspace / "exploit.py").is_file())
-            self.assertTrue((workspace / "state.json").is_file())
-            self.assertTrue((workspace / "notes.md").is_file())
+            self.assertTrue((workspace / "artifacts").is_dir())
+            self.assertTrue((workspace / "logs").is_dir())
             self.assertTrue((workspace / "transcripts").is_dir())
-            state = json.loads(
-                (workspace / "state.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(state["status"], "ingest")
-            self.assertEqual(state["challenge_id"], "ret2win")
-            self.assertEqual(state["facts"], [])
-            self.assertEqual(state["capabilities"], {})
-            self.assertEqual(binary.read_bytes(), b"\x7fELFfixture")
+            self.assertEqual(payload["category"], "pwn")
 
-    def test_verify_flag_rejects_user_input_echo(self) -> None:
+    def test_init_run_maps_unambiguous_legacy_run_flags(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            output1 = root / "run1.bin"
-            output2 = root / "run2.bin"
-            sent = root / "sent.bin"
-            result_path = root / "result.json"
-            output1.write_bytes(b"hello FLAG{demo}\n")
-            output2.write_bytes(b"hello FLAG{demo}\n")
-            sent.write_bytes(b"FLAG{demo}\n")
+            event_root = Path(temp) / "event"
+            challenge = self.make_challenge(event_root)
 
             result = run_script(
-                "verify_flag.py",
-                "--output",
-                str(output1),
-                "--output",
-                str(output2),
-                "--sent",
-                str(sent),
-                "--pattern",
-                r"FLAG\{[^}\r\n]+\}",
-                "--result",
-                str(result_path),
+                "init_run.py",
+                str(challenge),
+                "--runs-root",
+                str(event_root / "runs"),
+                "--run-id",
+                "legacy-pwn-run",
             )
 
-            self.assertEqual(result.returncode, 2)
-            self.assertTrue(result_path.is_file(), result.stderr)
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["status"], "unverified")
-            self.assertEqual(payload["reason"], "candidate_was_user_input")
-            self.assertIsNone(payload["flag"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["session_id"], "legacy-pwn-run")
+            self.assertEqual(Path(payload["workspace"]).parents[2], event_root / "runs" / "pwn")
 
-    def test_verify_flag_requires_reproduction_and_accepts_real_candidate(
+    def test_verify_flag_uses_race_mode_for_one_non_echoed_target_output(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            output1 = root / "run1.bin"
-            output2 = root / "run2.bin"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            output = root / "target.bin"
             sent = root / "sent.bin"
             result_path = root / "result.json"
-            output1.write_bytes(b"menu\nFLAG{real_flag}\n")
-            output2.write_bytes(b"welcome\nFLAG{real_flag}\n")
-            sent.write_bytes(b"1\n2\n")
+            output.write_bytes(b"target response FLAG{real_flag}\n")
+            sent.write_bytes(b"menu choice 1\n")
 
             result = run_script(
                 "verify_flag.py",
+                "--workspace",
+                str(workspace),
                 "--output",
-                str(output1),
-                "--output",
-                str(output2),
+                str(output),
                 "--sent",
                 str(sent),
                 "--pattern",
@@ -147,10 +108,59 @@ class PwnAgentScriptTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "verified")
             self.assertEqual(payload["flag"], "FLAG{real_flag}")
-            self.assertEqual(payload["reproductions"], 2)
+            self.assertEqual(payload["reproductions"], 1)
+            self.assertEqual(json.loads(result_path.read_text(encoding="utf-8")), payload)
+
+    def test_verify_flag_rejects_user_input_echo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            output = root / "target.bin"
+            sent = root / "sent.bin"
+            output.write_bytes(b"FLAG{echoed}\n")
+            sent.write_bytes(b"FLAG{echoed}\n")
+
+            result = run_script(
+                "verify_flag.py",
+                "--workspace",
+                str(workspace),
+                "--output",
+                str(output),
+                "--sent",
+                str(sent),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "unverified")
+            self.assertEqual(payload["reason"], "candidate_was_user_input")
+
+    def test_verify_flag_forwards_strict_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            output = root / "target.bin"
+            output.write_bytes(b"FLAG{one_run}\n")
+
+            result = run_script(
+                "verify_flag.py",
+                "--workspace",
+                str(workspace),
+                "--output",
+                str(output),
+                "--strict",
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(
+                json.loads(result.stdout)["reason"],
+                "requires_two_clean_reproductions",
+            )
 
 
 if __name__ == "__main__":

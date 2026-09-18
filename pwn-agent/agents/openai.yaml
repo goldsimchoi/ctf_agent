@@ -5,12 +5,12 @@ interface:
 dependencies:
   tools:
     - type: "mcp"
-      value: "pwndbg"
-      description: "Stateful GDB and pwndbg debugging in WSL"
+      value: "gdb"
+      description: "Stateful local GDB debugging"
       transport: "stdio"
     - type: "mcp"
-      value: "idapro"
-      description: "IDA Pro analysis through the local RPC bridge"
+      value: "idalib"
+      description: "Local IDA library analysis"
       transport: "stdio"
 policy:
   allow_implicit_invocation: true

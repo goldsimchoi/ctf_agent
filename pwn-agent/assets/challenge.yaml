@@ -9,4 +9,6 @@ binary: input/chall
 # flag_patterns:
 #   - 'FLAG\{[^}\r\n]+\}'
 # timeout_seconds: 300
+# wall_time_seconds: 900
+# mode: race
 # authorized: true
