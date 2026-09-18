@@ -17,6 +17,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "ctf-common" / "scripts"
 sys.path.insert(0, str(REPO_ROOT / "ctf-common" / "scripts"))
 
+from ctf_intake import (  # noqa: E402
+    MAX_STATEMENT_BYTES,
+    IntakeRequest,
+    read_request_json,
+)
 from ctf_workspace import (  # noqa: E402
     BudgetExhausted,
     CollisionError,
@@ -31,13 +36,17 @@ from ctf_workspace import (  # noqa: E402
 
 
 def run_common_script(
-    name: str, *args: str, timeout: float | None = None
+    name: str,
+    *args: str,
+    input: str | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPTS_DIR / name), *args],
         text=True,
         capture_output=True,
         check=False,
+        input=input,
         timeout=timeout,
     )
 
@@ -87,6 +96,379 @@ class CommonWorkspaceTests(unittest.TestCase):
             },
         }
         return output, sent, publish_capture_attestation(workspace, attestation)
+
+    @staticmethod
+    def snapshot_tree(root: Path) -> dict[str, tuple[str, bytes | str]]:
+        snapshot: dict[str, tuple[str, bytes | str]] = {}
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                snapshot[relative] = ("symlink", os.readlink(path))
+            elif path.is_dir():
+                snapshot[relative] = ("directory", "")
+            elif path.is_file():
+                snapshot[relative] = ("file", path.read_bytes())
+            else:
+                snapshot[relative] = ("other", "")
+        return snapshot
+
+    def test_flat_and_fileless_intake_does_not_mutate_challenge_inputs(self) -> None:
+        flat = Path(self.temp.name) / "flat-event"
+        pwn = flat / "babypwn"
+        rev = flat / "crackme"
+        web = flat / "admin-panel"
+        for challenge in (pwn, rev, web):
+            challenge.mkdir(parents=True)
+        (pwn / "chall").write_bytes(b"ELF fixture")
+        (rev / "checker").write_bytes(b"PE fixture")
+        before = {path.name: self.snapshot_tree(path) for path in (pwn, rev, web)}
+
+        pwn_row = create_session(
+            pwn, "pwn", intake=IntakeRequest(statement="local pwn", binary="chall")
+        )
+        rev_row = create_session(
+            rev, "rev", intake=IntakeRequest(statement="local rev", binary="checker")
+        )
+        request = IntakeRequest(
+            statement="관리자 페이지에서 플래그를 찾아라\nhttps://box.example:8443/start?q=1",
+            target="https://box.example:8443/start?q=1",
+        )
+        web_row = create_session(web, "web", intake=request)
+
+        self.assertEqual(
+            {path.name: self.snapshot_tree(path) for path in (pwn, rev, web)}, before
+        )
+        self.assertEqual(pwn_row["intake"]["target_status"], "bound")
+        self.assertEqual(rev_row["intake"]["target_status"], "bound")
+        stored = json.loads(
+            (web_row["workspace"] / "challenge-request.json").read_text(encoding="utf-8")
+        )
+        resolved = (web_row["workspace"] / "challenge.resolved.yaml").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(stored["statement"], request.statement)
+        self.assertEqual(stored["normalized"]["origin"], "https://box.example:8443")
+        self.assertIn("origin: https://box.example:8443", resolved)
+        self.assertNotIn(request.statement, resolved)
+        self.assertEqual(web_row["intake"]["target_status"], "bound")
+
+    def test_event_root_itself_is_not_a_challenge_but_direct_child_is(self) -> None:
+        managed = Path(self.temp.name) / "CTF"
+        (managed / ".tools").mkdir(parents=True)
+        (managed / ".tools" / "env.sh").write_text("export SAFE=1\n", encoding="utf-8")
+        (managed / ".venv").mkdir()
+        (managed / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
+        problem = managed / "direct-problem"
+        problem.mkdir()
+
+        with self.assertRaisesRegex(InvalidInput, "event root"):
+            create_session(managed, "web", managed)
+
+        row = create_session(
+            problem,
+            "web",
+            managed,
+            intake=IntakeRequest(target="https://box.example/"),
+        )
+        self.assertTrue((managed / "runs").is_dir())
+        self.assertEqual(row["workspace"].parents[4], managed)
+
+    def test_request_json_stdin_is_inert_lossless_and_single_document(self) -> None:
+        challenge = Path(self.temp.name) / "stdin-web"
+        challenge.mkdir()
+        marker = Path(self.temp.name) / "must-not-exist"
+        statement = (
+            "관리자 페이지\nEnglish `quoted` \"text\" "
+            f"$(touch {marker}) {{{{ template.value }}}}"
+        )
+        payload = json.dumps(
+            {"statement": statement, "target": "https://box.example:443/start?q=1"},
+            ensure_ascii=False,
+        )
+
+        result = run_common_script(
+            "init_session.py",
+            str(challenge),
+            "--category",
+            "web",
+            "--request-json",
+            "-",
+            input=payload,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(len(result.stdout.splitlines()), 1)
+        row = json.loads(result.stdout)
+        self.assertEqual(row["intake"]["target_status"], "bound")
+        stored = json.loads(Path(row["intake"]["request_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(stored["statement"], statement)
+        self.assertEqual(stored["normalized"]["origin"], "https://box.example")
+        self.assertFalse(marker.exists())
+
+    def test_request_json_wire_bound_allows_a_maximum_escaped_statement(self) -> None:
+        statement = "\\" * MAX_STATEMENT_BYTES
+        encoded = json.dumps({"statement": statement}).encode("utf-8")
+
+        request = read_request_json(io.BytesIO(encoded))
+
+        self.assertEqual(request.statement, statement)
+
+    def test_request_json_rejects_invalid_shape_size_and_mixed_flags(self) -> None:
+        cases = (
+            (json.dumps({"unknown": "value"}), ()),
+            (json.dumps({"target": 31337}), ()),
+            (json.dumps(["not", "an", "object"]), ()),
+            (json.dumps({"statement": "x" * (1024 * 1024)}), ()),
+            (json.dumps({"statement": "ok"}), ("--statement", "mixed")),
+        )
+        for index, (payload, extra) in enumerate(cases):
+            with self.subTest(index=index):
+                challenge = Path(self.temp.name) / f"invalid-json-{index}"
+                challenge.mkdir()
+                result = run_common_script(
+                    "init_session.py",
+                    str(challenge),
+                    "--category",
+                    "web",
+                    "--request-json",
+                    "-",
+                    *extra,
+                    input=payload,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(len(result.stdout.splitlines()), 1)
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+                self.assertFalse((challenge.parent / "runs").exists())
+
+    def test_request_json_path_is_bounded_regular_and_nofollow(self) -> None:
+        challenge = Path(self.temp.name) / "json-path-web"
+        challenge.mkdir()
+        request_file = Path(self.temp.name) / "request.json"
+        request_file.write_text(
+            json.dumps({"target": "https://box.example/"}), encoding="utf-8"
+        )
+        success = run_common_script(
+            "init_session.py",
+            str(challenge),
+            "--category",
+            "web",
+            "--request-json",
+            str(request_file),
+        )
+        self.assertEqual(success.returncode, 0, success.stdout)
+
+        link = Path(self.temp.name) / "request-link.json"
+        link.symlink_to(request_file)
+        rejected = run_common_script(
+            "init_session.py",
+            str(challenge),
+            "--category",
+            "web",
+            "--request-json",
+            str(link),
+        )
+        self.assertEqual(rejected.returncode, 2)
+
+    def test_target_normalization_and_category_rejections(self) -> None:
+        pwn_targets = {
+            "nc pwn.example 31337": ("pwn.example", 31337),
+            "pwn.example:31337": ("pwn.example", 31337),
+            "tcp://pwn.example:31337": ("pwn.example", 31337),
+        }
+        for index, (target, expected) in enumerate(pwn_targets.items()):
+            with self.subTest(target=target):
+                challenge = Path(self.temp.name) / f"pwn-{index}"
+                challenge.mkdir()
+                row = create_session(challenge, "pwn", intake=IntakeRequest(target=target))
+                stored = json.loads(
+                    (row["workspace"] / "challenge-request.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    (stored["normalized"]["host"], stored["normalized"]["port"]), expected
+                )
+                self.assertEqual(stored["normalized"]["target"], "tcp://pwn.example:31337")
+
+        ipv6 = Path(self.temp.name) / "pwn-ipv6"
+        ipv6.mkdir()
+        ipv6_row = create_session(
+            ipv6,
+            "pwn",
+            intake=IntakeRequest(target="tcp://[2001:db8::1]:31337"),
+        )
+        ipv6_manifest = (
+            ipv6_row["workspace"] / "challenge.resolved.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn('host: "[2001:db8::1]"', ipv6_manifest)
+        ipv6_stored = json.loads(
+            (ipv6_row["workspace"] / "challenge-request.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            ipv6_stored["normalized"]["target"],
+            "tcp://[2001:db8::1]:31337",
+        )
+
+        invalid = {
+            "web": (
+                "https://user:pass@box.example/",
+                "https://box.example/path#fragment",
+                "https://box.example/path#",
+                "ftp://box.example/file",
+            ),
+            "pwn": (
+                "tcp://pwn.example:31337/path",
+                "tcp://pwn.example:31337?",
+                "tcp://pwn.example:31337#",
+                "pwn.example:0",
+                "pwn.example:65536",
+            ),
+            "rev": ("https://box.example/", "pwn.example:31337"),
+        }
+        for category, targets in invalid.items():
+            for target in targets:
+                with self.subTest(category=category, target=target):
+                    challenge = Path(self.temp.name) / f"bad-{category}-{abs(hash(target))}"
+                    challenge.mkdir()
+                    with self.assertRaises(ValueError):
+                        create_session(
+                            challenge, category, intake=IntakeRequest(target=target)
+                        )
+
+    def test_prompt_and_legacy_conflicts_leave_no_usable_session(self) -> None:
+        cases = (
+            (
+                "web",
+                "id: conflict\norigin: https://legacy.example\nstart_url: https://legacy.example/\n",
+                IntakeRequest(target="https://prompt.example/"),
+            ),
+            (
+                "rev",
+                "id: conflict\nbinary: legacy\n",
+                IntakeRequest(binary="prompt"),
+            ),
+            (
+                "web",
+                "id: conflict\ntarget: https://legacy.example/one\n",
+                IntakeRequest(target="https://legacy.example/two"),
+            ),
+            (
+                "rev",
+                "id: conflict\nbinary: prompt\nauthorized: false\n",
+                IntakeRequest(binary="prompt"),
+            ),
+        )
+        for index, (category, manifest, request) in enumerate(cases):
+            with self.subTest(category=category):
+                event = Path(self.temp.name) / f"conflict-{index}"
+                challenge = event / "challenge"
+                challenge.mkdir(parents=True)
+                (challenge / "challenge.yaml").write_text(manifest, encoding="utf-8")
+                (challenge / "legacy").write_bytes(b"legacy")
+                (challenge / "prompt").write_bytes(b"prompt")
+                result = run_common_script(
+                    "init_session.py",
+                    str(challenge),
+                    "--category",
+                    category,
+                    "--statement",
+                    request.statement,
+                    *(("--target", request.target) if request.target is not None else ()),
+                    *(("--binary", request.binary) if request.binary is not None else ()),
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+                sessions = (
+                    list((event / "runs").glob("**/sessions/*"))
+                    if (event / "runs").exists()
+                    else []
+                )
+                self.assertEqual(sessions, [])
+
+    def test_selected_binary_is_contained_regular_and_not_size_limited(self) -> None:
+        event = Path(self.temp.name) / "binary-event"
+        challenge = event / "chall"
+        challenge.mkdir(parents=True)
+        binary = challenge / "chall"
+        with binary.open("wb") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+
+        row = create_session(
+            challenge, "rev", intake=IntakeRequest(statement="reverse it", binary="chall")
+        )
+        stored = json.loads(
+            (row["workspace"] / "challenge-request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(stored["binary"], "chall")
+        self.assertIn("binary: chall", (row["workspace"] / "challenge.resolved.yaml").read_text())
+
+    def test_unsafe_binary_values_fail_without_blocking_or_reading_outside(self) -> None:
+        event = Path(self.temp.name) / "unsafe-binary-event"
+        challenge = event / "chall"
+        challenge.mkdir(parents=True)
+        outside = event / "outside"
+        outside.write_bytes(b"outside")
+        (challenge / "directory").mkdir()
+        os.mkfifo(challenge / "fifo")
+        (challenge / "link").symlink_to(outside)
+        cases = (str(outside), "../outside", "directory", "fifo", "link")
+
+        for value in cases:
+            with self.subTest(binary=value):
+                try:
+                    result = run_common_script(
+                        "init_session.py",
+                        str(challenge),
+                        "--category",
+                        "rev",
+                        "--binary",
+                        value,
+                        timeout=1,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail(f"binary validation blocked for {value!r}")
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+        self.assertEqual(outside.read_bytes(), b"outside")
+        self.assertFalse((event / "runs").exists())
+
+    def test_combined_fingerprint_uses_canonical_intake_and_keeps_file_digest(self) -> None:
+        event = Path(self.temp.name) / "fingerprint-event"
+        challenge = event / "empty-web"
+        challenge.mkdir(parents=True)
+        request = IntakeRequest(
+            statement="same statement", target="https://box.example:443/start?q=1"
+        )
+
+        same_a = create_session(challenge, "web", intake=request)
+        same_b = create_session(
+            challenge,
+            "web",
+            intake=IntakeRequest(
+                statement=request.statement,
+                target="https://box.example/start?q=1",
+            ),
+        )
+        other = create_session(
+            challenge,
+            "web",
+            intake=IntakeRequest(
+                statement=request.statement,
+                target="https://other.example/",
+            ),
+        )
+        self.assertEqual(same_a["fingerprint"], same_b["fingerprint"])
+        self.assertNotEqual(same_a["fingerprint"], other["fingerprint"])
+        self.assertEqual(same_a["workspace"].parents[1], same_b["workspace"].parents[1])
+        self.assertNotEqual(same_a["workspace"].parents[1], other["workspace"].parents[1])
+        self.assertEqual(same_a["file_fingerprint"], same_b["file_fingerprint"])
+        stored = json.loads(
+            (same_a["workspace"] / "challenge-request.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(stored["file_fingerprint"], same_a["file_fingerprint"])
+        self.assertEqual(stored["fingerprint"], same_a["fingerprint"])
 
     def test_challenges_and_categories_receive_isolated_workspaces(self) -> None:
         web = create_session(self.challenge, "web")

@@ -15,6 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
+from ctf_intake import (
+    IntakeRequest,
+    render_resolved_manifest,
+    resolve_intake,
+)
+
 
 CATEGORIES = {"pwn", "web", "rev"}
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
@@ -275,20 +281,50 @@ def _event_root_for(challenge: Path, event_root: Path | None) -> Path:
         root = challenge.parent.parent
     else:
         root = challenge.parent
+    if challenge == root:
+        raise InvalidInput(f"challenge must be below event root: {root}")
     if not _under(challenge, root):
         raise InvalidInput(f"challenge is outside event root: {challenge}")
     return root
 
 
 def _manifest_scalars(challenge: Path) -> dict[str, str]:
-    manifest = next(
-        (path for path in (challenge / "challenge.yaml", challenge / "challenge.yml") if path.is_file()),
-        None,
-    )
-    if manifest is None:
+    content: bytes | None = None
+    descriptor = _open_directory_nofollow(challenge)
+    try:
+        for name in ("challenge.yaml", "challenge.yml"):
+            file_descriptor: int | None = None
+            try:
+                file_descriptor = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                raise InvalidInput(
+                    f"legacy manifest is unreadable: {challenge / name}"
+                ) from exc
+            try:
+                metadata = os.fstat(file_descriptor)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise InvalidInput(
+                        f"legacy manifest is not a regular file: {challenge / name}"
+                    )
+                chunks: list[bytes] = []
+                while block := os.read(file_descriptor, 1024 * 1024):
+                    chunks.append(block)
+                content = b"".join(chunks)
+            finally:
+                os.close(file_descriptor)
+            break
+    finally:
+        os.close(descriptor)
+    if content is None:
         return {}
     values: dict[str, str] = {}
-    for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line in content.decode("utf-8", errors="replace").splitlines():
         match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*(?:#.*)?$", line)
         if not match:
             continue
@@ -297,6 +333,39 @@ def _manifest_scalars(challenge: Path) -> dict[str, str]:
         if value and not value.startswith(("[", "{", "|", ">")):
             values[key] = value
     return values
+
+
+def _validate_selected_binary(challenge: Path, value: str) -> str:
+    """Bind a challenge-relative regular file without following or reading it."""
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts:
+        raise InvalidInput("binary must be a challenge-relative path")
+    parts = relative.parts
+    if any(part in {"", ".", ".."} for part in parts):
+        raise InvalidInput("binary path must not contain dot components")
+    descriptor = _open_directory_nofollow(challenge)
+    file_descriptor: int | None = None
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_NOFOLLOW | os.O_NONBLOCK
+        file_descriptor = os.open(parts[-1], flags, dir_fd=descriptor)
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InvalidInput(f"binary is not a regular file: {value}")
+    except OSError as exc:
+        raise InvalidInput(f"binary is not a contained regular file: {value}") from exc
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(descriptor)
+    return Path(*parts).as_posix()
 
 
 def challenge_fingerprint(challenge: Path) -> str:
@@ -495,6 +564,8 @@ def create_session(
     category: str,
     event_root: Path | None = None,
     session_id: str | None = None,
+    *,
+    intake: IntakeRequest | None = None,
 ) -> dict[str, Any]:
     """Create one isolated workspace and return its resolved metadata."""
     if category not in CATEGORIES:
@@ -503,7 +574,34 @@ def create_session(
     root = _event_root_for(challenge, event_root)
     manifest = _manifest_scalars(challenge)
     slug = safe_slug(manifest.get("id", challenge.name))
-    fingerprint = challenge_fingerprint(challenge)
+    resolved_intake = resolve_intake(category, intake or IntakeRequest(), manifest)
+    effective_manifest = resolved_intake["manifest"]
+    if "binary" in effective_manifest:
+        effective_manifest["binary"] = _validate_selected_binary(
+            challenge, effective_manifest["binary"]
+        )
+    file_fingerprint = challenge_fingerprint(challenge)
+    fingerprint_fields = {
+        "category": category,
+        "statement": resolved_intake["statement"],
+        "normalized": resolved_intake["normalized"],
+        "binary": effective_manifest.get("binary"),
+        "flag_pattern": effective_manifest.get("flag_pattern"),
+        "manifest": effective_manifest,
+    }
+    intake_bytes = json.dumps(
+        fingerprint_fields,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    fingerprint = hashlib.sha256(
+        bytes.fromhex(file_fingerprint) + intake_bytes
+    ).hexdigest()
+    request_record = dict(resolved_intake)
+    request_record["file_fingerprint"] = file_fingerprint
+    request_record["fingerprint"] = fingerprint
+    rendered_manifest = render_resolved_manifest(slug, category, resolved_intake)
     common_root = _safe_directory(root, "runs", category, f"{slug}-{fingerprint[:12]}")
     sessions = _safe_directory(common_root, "sessions")
     _safe_directory(common_root, "shared", "findings")
@@ -526,7 +624,7 @@ def create_session(
             _safe_directory(workspace, name)
         started_at = _utc_now().isoformat()
         try:
-            wall_time = int(manifest.get("wall_time_seconds", "0"))
+            wall_time = int(effective_manifest.get("wall_time_seconds", "0"))
         except ValueError as exc:
             raise InvalidInput("wall_time_seconds must be an integer") from exc
         if wall_time < 0:
@@ -536,6 +634,7 @@ def create_session(
             "category": category,
             "challenge": str(challenge),
             "event_root": str(root),
+            "file_fingerprint": file_fingerprint,
             "fingerprint": fingerprint,
             "session_id": identifier,
             "started_at": started_at,
@@ -548,18 +647,10 @@ def create_session(
             "started_at": started_at,
             "wall_time_seconds": wall_time,
         }
+        _atomic_json(workspace / "challenge-request.json", request_record)
+        _atomic_text(workspace / "challenge.resolved.yaml", rendered_manifest)
         _atomic_json(workspace / "session.json", session)
         _atomic_json(workspace / "state.json", state)
-        resolved = challenge / "challenge.yaml"
-        if resolved.is_file():
-            _atomic_text(
-                workspace / "challenge.resolved.yaml",
-                resolved.read_text(encoding="utf-8", errors="replace"),
-            )
-        else:
-            _atomic_text(
-                workspace / "challenge.resolved.yaml", f"id: {slug}\ncategory: {category}\n"
-            )
         _atomic_text(workspace / "notes.md", f"# {slug}\n\n## Facts\n\n## Attempts\n")
     except BaseException:
         # A partially initialized session is never a usable collision target.
@@ -576,8 +667,17 @@ def create_session(
         "workspace": workspace,
         "category": category,
         "challenge_id": slug,
+        "file_fingerprint": file_fingerprint,
         "fingerprint": fingerprint,
         "session_id": identifier,
+        "intake": {
+            "source": resolved_intake["source"],
+            "target_status": resolved_intake["target_status"],
+            "request_path": str((workspace / "challenge-request.json").resolve()),
+            "resolved_manifest_path": str(
+                (workspace / "challenge.resolved.yaml").resolve()
+            ),
+        },
         "findings": findings,
         "skipped_findings": skipped_findings,
     }

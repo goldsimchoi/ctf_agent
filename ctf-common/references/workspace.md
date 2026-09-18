@@ -11,6 +11,64 @@ minimal resolved manifest into the session and creates `artifacts`, `logs`,
 and `transcripts`. New sessions return valid shared findings from the matching
 category/challenge fingerprint only.
 
+## Zero-config intake
+
+A challenge may be a dedicated flat problem directory directly below the event
+root or an event-organized `challenges/<problem>` directory. Pass the managed
+event root with `--event-root`; the root itself is never accepted as a
+challenge. The initializer does not write to the challenge directory, and an
+empty directory is valid for a fileless web challenge.
+
+The normal agent transport is one bounded JSON object on standard input:
+
+```sh
+python3 init_session.py /home/normalone/CTF/event/problem \
+  --event-root /home/normalone/CTF --category web --request-json -
+```
+
+```json
+{
+  "statement": "the exact multiline event statement",
+  "target": "https://box.example/start?q=1",
+  "binary": "optional/challenge-relative-file",
+  "flag_pattern": "FLAG\\{[^}]+\\}"
+}
+```
+
+All four keys are optional strings; unknown keys, non-string values, control
+characters, invalid category fields, and oversized input are rejected. The
+statement is limited to 256 KiB and each other field to 4 KiB. A no-follow
+regular-file path can replace `-`. The individual `--statement`, `--target`,
+`--binary`, and `--flag-pattern` options are also available, but cannot be
+mixed with `--request-json`.
+
+Every allocated session contains an immutable `challenge-request.json` with
+the exact statement, normalized selection, effective scalar manifest,
+file-only fingerprint, and combined fingerprint. The sibling
+`challenge.resolved.yaml` contains only safely encoded adapter fields; free-form
+statement text is never copied into YAML. A selected binary must be a regular,
+non-symlink file reached through a challenge-relative no-follow path.
+
+The returned `intake.target_status` is:
+
+- `bound`: an exact web origin, TCP tuple, or local binary is selected;
+- `local_only`: pwn intake has no network address or selected binary; or
+- `needs_selection`: web or reversing intake needs an explicit compatible
+  target before any target interaction.
+
+`intake.source` reports `minimal`, `prompt`, `legacy_manifest`, or
+`prompt_and_manifest`. Prompt fields can fill missing legacy manifest values,
+but conflicting targets, binaries, categories, or authorization policy fail
+closed. Web targets bind one HTTP(S) origin, pwn targets bind one TCP tuple,
+and reversing intake rejects network targets.
+
+The run directory uses a combined fingerprint: the file-only challenge digest
+plus canonical JSON for the category, exact statement, normalized target,
+selected binary, flag pattern, and effective legacy scalars. Equivalent
+normalized intake shares a run root while each invocation still receives a
+new collision-safe session ID. A different statement or target therefore
+cannot reuse findings from an otherwise identical empty or file-backed input.
+
 Publish only evidence files inside the originating session with
 `publish_finding.py`. Findings are atomically created JSON records under the
 common workspace's `shared/findings/<session-id>/`; they are never updated.
