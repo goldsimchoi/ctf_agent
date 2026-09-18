@@ -1,0 +1,7 @@
+id: example-web
+category: web
+authorized: true
+network_access: agent_allowed
+origin: http://127.0.0.1:8080
+wall_time_seconds: 900
+mode: race

@@ -1,0 +1,13 @@
+interface:
+  display_name: "Web Agent"
+  short_description: "Solve authorized CTF web challenges with session-isolated evidence"
+  default_prompt: "Use $web-agent to solve this authorized web challenge and return a verified flag."
+dependencies:
+  tools:
+    - type: "local"
+      value: "python3"
+      description: "Session state, HTTP evidence, and verification helpers"
+policy:
+  allow_implicit_invocation: true
+sources:
+  - "https://h4c.team/posts/74"
