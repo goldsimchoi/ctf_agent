@@ -515,48 +515,69 @@ class RevAgentTests(unittest.TestCase):
                  "--evidence", "gdb/lock-conflict.txt", "--summary", "conflict"],
             ]
             processes: list[subprocess.Popen[str]] = []
-            queued = False
-            with lock_path.open("a+", encoding="utf-8") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            captures: dict[int, tuple[str, str]] = {}
+
+            def reap(process: subprocess.Popen[str], timeout: float) -> tuple[str, str]:
+                if process.pid in captures:
+                    return captures[process.pid]
                 try:
-                    inode = lock_path.stat().st_ino
-                    processes = [
-                        subprocess.Popen(
-                            [sys.executable, str(SCRIPTS / "record_clue.py"), *command],
-                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        )
-                        for command in commands
-                    ]
-                    deadline = time.monotonic() + 3
-                    observed: set[int] = set()
-                    while time.monotonic() < deadline:
-                        locks = Path("/proc/locks").read_text(encoding="utf-8")
-                        for process in processes:
-                            if process.poll() is None and any(
-                                "-> FLOCK" in line and f" {process.pid} " in line and f":{inode} " in line
-                                for line in locks.splitlines()
-                            ):
-                                observed.add(process.pid)
-                        if len(observed) == len(processes):
-                            break
-                        time.sleep(0.01)
-                    self.assertEqual(observed, {process.pid for process in processes})
-                    queued = True
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-                    if not queued:
-                        for process in processes:
-                            if process.poll() is None:
-                                process.terminate()
-                        for process in processes:
-                            try:
-                                process.communicate(timeout=1)
-                            except subprocess.TimeoutExpired:
-                                process.kill()
-                                process.communicate(timeout=1)
-                            process.wait(timeout=1)
-            results = [process.communicate(timeout=3) for process in processes]
-            self.assertTrue(all(process.returncode == 0 for process in processes), results)
+                    captures[process.pid] = process.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    try:
+                        process.terminate()
+                    except (ProcessLookupError, OSError):
+                        pass
+                    try:
+                        captures[process.pid] = process.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            process.kill()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        try:
+                            captures[process.pid] = process.communicate(timeout=1)
+                        except (subprocess.TimeoutExpired, OSError):
+                            captures[process.pid] = ("", "")
+                    try:
+                        process.wait(timeout=1)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                return captures[process.pid]
+
+            try:
+                with lock_path.open("a+", encoding="utf-8") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    try:
+                        inode = lock_path.stat().st_ino
+                        for command in commands:
+                            processes.append(subprocess.Popen(
+                                [sys.executable, str(SCRIPTS / "record_clue.py"), *command],
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            ))
+                        deadline = time.monotonic() + 3
+                        observed: set[int] = set()
+                        while time.monotonic() < deadline:
+                            locks = Path("/proc/locks").read_text(encoding="utf-8")
+                            for process in processes:
+                                if process.poll() is None and any(
+                                    "-> FLOCK" in line and f" {process.pid} " in line and f":{inode} " in line
+                                    for line in locks.splitlines()
+                                ):
+                                    observed.add(process.pid)
+                            if len(observed) == len(processes):
+                                break
+                            time.sleep(0.01)
+                        self.assertEqual(observed, {process.pid for process in processes})
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                results = [reap(process, 3) for process in processes]
+                self.assertTrue(all(process.returncode == 0 for process in processes), results)
+            finally:
+                for process in processes:
+                    try:
+                        reap(process, 0.2)
+                    except BaseException:
+                        pass
             ledger = json.loads((workspace / "rev" / "hypotheses.json").read_text())["hypotheses"][0]
             self.assertEqual(len(ledger["experiments"]), 1)
             self.assertEqual(len(ledger["contradiction_ids"]), 1)
