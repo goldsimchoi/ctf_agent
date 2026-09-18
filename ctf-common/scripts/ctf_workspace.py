@@ -18,6 +18,8 @@ from typing import Any, Iterator
 
 CATEGORIES = {"pwn", "web", "rev"}
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+MAX_VERIFICATION_ARTIFACTS = 16
+MAX_VERIFICATION_BYTES = 8 * 1024 * 1024
 DEFAULT_PATTERNS = (
     rb"FLAG\{[^}\r\n]+\}",
     rb"flag\{[^}\r\n]+\}",
@@ -41,6 +43,10 @@ class ArtifactTooLarge(InvalidInput):
     """Raised when an artifact exceeds the bounded common-reader contract."""
 
 
+class VerificationBudgetExceeded(InvalidInput):
+    """Raised when a verification request exceeds its aggregate read budget."""
+
+
 class JsonArgumentParser(argparse.ArgumentParser):
     """Turn invalid command-line input into a caller-owned JSON error."""
 
@@ -54,6 +60,30 @@ class OpenedArtifact:
     data: bytes
     device: int
     inode: int
+
+
+class VerificationReadBudget:
+    """Bound and reuse descriptor-read bytes for one verification request."""
+
+    def __init__(self, maximum: int) -> None:
+        self.maximum = maximum
+        self.total = 0
+        self._data_by_identity: dict[tuple[int, int], bytes] = {}
+
+    def cached(self, device: int, inode: int) -> bytes | None:
+        return self._data_by_identity.get((device, inode))
+
+    def remaining(self) -> int:
+        return self.maximum - self.total
+
+    def store(self, device: int, inode: int, data: bytes) -> None:
+        identity = (device, inode)
+        if identity in self._data_by_identity:
+            return
+        if len(data) > self.remaining():
+            raise VerificationBudgetExceeded("verification request exceeds aggregate artifact budget")
+        self._data_by_identity[identity] = data
+        self.total += len(data)
 
 
 def _utc_now() -> dt.datetime:
@@ -132,7 +162,12 @@ def _open_directory_nofollow(path: Path) -> int:
     return descriptor
 
 
-def _read_regular_under(root: Path, path: Path, description: str) -> OpenedArtifact:
+def _read_regular_under(
+    root: Path,
+    path: Path,
+    description: str,
+    budget: VerificationReadBudget | None = None,
+) -> OpenedArtifact:
     """Read one contained regular file via no-follow directory descriptors."""
     root = _resolve_directory(root, "artifact root")
     raw = path.expanduser().absolute()
@@ -154,14 +189,25 @@ def _read_regular_under(root: Path, path: Path, description: str) -> OpenedArtif
             raise InvalidInput(f"{description} is not a regular file: {raw}")
         if metadata.st_size > MAX_ARTIFACT_BYTES:
             raise ArtifactTooLarge(f"{description} exceeds {MAX_ARTIFACT_BYTES} bytes: {raw}")
+        if budget is not None:
+            cached = budget.cached(metadata.st_dev, metadata.st_ino)
+            if cached is not None:
+                return OpenedArtifact(raw, cached, metadata.st_dev, metadata.st_ino)
+            if metadata.st_size > budget.remaining():
+                raise VerificationBudgetExceeded("verification request exceeds aggregate artifact budget")
         chunks: list[bytes] = []
         total = 0
         while block := os.read(file_descriptor, 1024 * 1024):
             total += len(block)
             if total > MAX_ARTIFACT_BYTES:
                 raise ArtifactTooLarge(f"{description} exceeds {MAX_ARTIFACT_BYTES} bytes: {raw}")
+            if budget is not None and total > budget.remaining():
+                raise VerificationBudgetExceeded("verification request exceeds aggregate artifact budget")
             chunks.append(block)
-        return OpenedArtifact(raw, b"".join(chunks), metadata.st_dev, metadata.st_ino)
+        data = b"".join(chunks)
+        if budget is not None:
+            budget.store(metadata.st_dev, metadata.st_ino, data)
+        return OpenedArtifact(raw, data, metadata.st_dev, metadata.st_ino)
     except OSError as exc:
         raise InvalidInput(f"{description} is unreadable: {raw}") from exc
     finally:
@@ -541,14 +587,12 @@ def publish_finding(workspace: Path, kind: str, evidence: Path, summary: str) ->
     kind = _validate_explicit_id(kind)
     if not summary.strip():
         raise InvalidInput("finding summary must not be empty")
-    evidence = _safe_file(evidence, "finding evidence")
-    if not _under(evidence, workspace):
-        raise InvalidInput("finding evidence must be a file inside its workspace")
+    evidence_snapshot = _read_regular_under(workspace, evidence, "finding evidence")
     destination = _safe_directory(common_root, "shared", "findings", workspace.name)
-    content = evidence.read_bytes()
+    content = evidence_snapshot.data
     for _ in range(16):
         stem = f"{_timestamp()}-{secrets.token_hex(4)}"
-        evidence_path = destination / f"{stem}-{safe_slug(evidence.name)}"
+        evidence_path = destination / f"{stem}-{safe_slug(evidence_snapshot.path.name)}"
         try:
             _write_new_bytes(evidence_path, content)
         except FileExistsError:
@@ -674,6 +718,12 @@ def _validate_capture_attestations(
     attestations: list[Path] | None,
 ) -> tuple[list[OpenedArtifact], list[OpenedArtifact], str | None]:
     """Validate capture provenance before a candidate can become a flag."""
+    if (
+        len(outputs) > MAX_VERIFICATION_ARTIFACTS
+        or len(sent) > MAX_VERIFICATION_ARTIFACTS
+        or (attestations is not None and len(attestations) > MAX_VERIFICATION_ARTIFACTS)
+    ):
+        return [], [], "verification_request_exceeds_budget"
     if workspace is None or attestations is None:
         return [], [], "missing_capture_attestation"
     try:
@@ -685,9 +735,12 @@ def _validate_capture_attestations(
         return [], [], "missing_sent_evidence"
     if len(outputs) != len(attestations):
         return [], [], "invalid_capture_attestation"
+    budget = VerificationReadBudget(MAX_VERIFICATION_BYTES)
     try:
-        safe_sent = [_read_regular_under(workspace, path, "sent evidence") for path in sent]
-        safe_outputs = [_read_regular_under(workspace, path, "capture output") for path in outputs]
+        safe_sent = [_read_regular_under(workspace, path, "sent evidence", budget) for path in sent]
+        safe_outputs = [_read_regular_under(workspace, path, "capture output", budget) for path in outputs]
+    except VerificationBudgetExceeded:
+        return [], [], "verification_request_exceeds_budget"
     except InvalidInput:
         return [], [], "invalid_capture_attestation"
     sent_by_path = {str(item.path): item for item in safe_sent}
@@ -699,7 +752,7 @@ def _validate_capture_attestations(
     capture_root = workspace / "artifacts" / "captures"
     for output, attestation_path in zip(safe_outputs, attestations, strict=True):
         try:
-            record = _read_regular_under(capture_root, attestation_path, "capture attestation")
+            record = _read_regular_under(capture_root, attestation_path, "capture attestation", budget)
             if record.path.parent != capture_root or record.path.suffix != ".json":
                 raise InvalidInput("capture attestation is not a capture artifact")
             attestation = json.loads(record.data.decode("utf-8"))
@@ -729,6 +782,8 @@ def _validate_capture_attestations(
                 or sent_record.get("sha256") != hashlib.sha256(sent_item.data).hexdigest()
             ):
                 raise InvalidInput("capture attestation does not match sent evidence")
+        except VerificationBudgetExceeded:
+            return safe_outputs, safe_sent, "verification_request_exceeds_budget"
         except (UnicodeDecodeError, InvalidInput, KeyError, TypeError, json.JSONDecodeError):
             return safe_outputs, safe_sent, "invalid_capture_attestation"
         relative_output = str(output.path.relative_to(workspace))

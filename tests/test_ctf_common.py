@@ -161,6 +161,18 @@ class CommonWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(list(outside.iterdir()), [])
 
+    def test_publisher_rejects_oversized_evidence_before_creating_shared_copy(self) -> None:
+        row = create_session(self.challenge, "web")
+        evidence = row["workspace"] / "artifacts" / "oversized.bin"
+        with evidence.open("wb") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+
+        with self.assertRaisesRegex(InvalidInput, "exceeds"):
+            publish_finding(row["workspace"], "endpoint", evidence, "oversized evidence")
+
+        destination = row["workspace"].parents[1] / "shared" / "findings" / row["session_id"]
+        self.assertFalse(destination.exists())
+
     def test_initializer_rejects_symlinked_sessions_component(self) -> None:
         row = create_session(self.challenge, "web")
         sessions = row["workspace"].parent
@@ -223,6 +235,42 @@ class CommonWorkspaceTests(unittest.TestCase):
         self.assertEqual(race["status"], "verified")
         self.assertEqual(race["flag"], "FLAG{real}")
         self.assertEqual(strict["reason"], "requires_two_clean_reproductions")
+
+    def test_verifier_rejects_more_than_sixteen_capture_paths(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, attestation = self.make_capture(row, "capture-one", b"FLAG{too_many}\n")
+
+        result = verify_outputs(
+            [output] * 17,
+            [sent],
+            (rb"FLAG\{[^}\r\n]+\}",),
+            strict=False,
+            workspace=row["workspace"],
+            attestations=[attestation] * 17,
+        )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "verification_request_exceeds_budget")
+
+    def test_verifier_rejects_capture_bytes_above_aggregate_budget(self) -> None:
+        row = create_session(self.challenge, "web")
+        first = self.make_capture(row, "capture-one", b"FLAG{first}\n")
+        second = self.make_capture(row, "capture-two", b"FLAG{second}\n")
+        artifacts = (*first, *second)
+        budget = sum(path.stat().st_size for path in artifacts) - 1
+
+        with patch("ctf_workspace.MAX_VERIFICATION_BYTES", budget, create=True):
+            result = verify_outputs(
+                [first[0], second[0]],
+                [first[1], second[1]],
+                (rb"FLAG\{[^}\r\n]+\}",),
+                strict=False,
+                workspace=row["workspace"],
+                attestations=[first[2], second[2]],
+            )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "verification_request_exceeds_budget")
 
     def test_verification_rejects_echoed_candidates(self) -> None:
         row = create_session(self.challenge, "web")

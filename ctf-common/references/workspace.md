@@ -72,3 +72,10 @@ reader checks `fstat` before allocation and its cumulative streamed byte count,
 so sparse or growing files cannot exceed this bound. Oversized verification
 artifacts yield `candidate_only`; oversized shared records or evidence are
 skipped with a reported reason.
+
+One verification request accepts at most 16 `--output`, 16 `--sent`, and 16
+`--attestation` paths. It retains at most **8 MiB** across unique opened
+`(st_dev, st_ino)` artifacts; repeated references to the same opened file reuse
+the first FD snapshot rather than counting or retaining its bytes again. A
+request exceeding either limit yields `candidate_only` with
+`verification_request_exceeds_budget`.
