@@ -1,0 +1,6 @@
+id: example-reversing
+category: rev
+authorized: true
+binary: input/chall
+wall_time_seconds: 900
+mode: race

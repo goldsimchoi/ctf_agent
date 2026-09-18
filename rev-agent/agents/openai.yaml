@@ -1,0 +1,21 @@
+interface:
+  display_name: "Reversing Agent"
+  short_description: "Solve authorized CTF reversing challenges with evidence-backed hypotheses"
+  default_prompt: "Use $rev-agent to solve this authorized reversing challenge and return a verified flag."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "idalib"
+      description: "Call graphs, xrefs, decompilation, and data-flow analysis"
+      transport: "stdio"
+    - type: "mcp"
+      value: "gdb"
+      description: "Controlled runtime traces and memory evidence"
+      transport: "stdio"
+    - type: "local"
+      value: "python3"
+      description: "Session state and executable oracle helpers"
+policy:
+  allow_implicit_invocation: true
+sources:
+  - "https://h4c.team/posts/49"
