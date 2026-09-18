@@ -22,8 +22,9 @@ adapts the coverage-ledger and state-discipline lessons from TeamH4C's
    ```
 
    Keep inputs read-only. The returned session owns `web/cookies.json`,
-   `web/browser-profile/`, raw `web/requests/` and `web/responses/`, the coverage
-   ledger, and capabilities. Never share a cookie jar or browser profile.
+  `web/browser-profile/`, `web/requests/`, `web/responses/`, and response
+  provenance, plus the coverage ledger and capabilities. Never share a cookie
+  jar or browser profile.
 3. Read existing immutable findings before one cheap triage pass. Reuse only
    evidence-backed facts from the matching fingerprint.
 
@@ -56,12 +57,14 @@ Playwright or WebSocket work, passing this session's browser profile.
 
 ## Finish
 
-Default `mode: race` reports the first non-echoed flag attributable to an
-authorized target response/browser artifact immediately:
+Default `mode: race` reports the first non-echoed flag attributable to a
+recorded authorized target response immediately. Use the web verifier; it
+rejects shell files, summaries, errors, and unprovenanced artifacts before it
+delegates candidate checking:
 
 ```text
-python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
-  --output web/responses/<response>.raw --sent web/requests/<request>.raw
+python3 <skill>/scripts/verify_web_flag.py --workspace <workspace> \
+  --output web/responses/<response>.raw
 ```
 
 For `mode: strict`, submit two clean target response files and add `--strict`.

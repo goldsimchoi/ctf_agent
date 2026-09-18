@@ -54,8 +54,9 @@ def init_web_state(workspace: Path) -> dict[str, str]:
     web = workspace / "web"
     requests_dir = web / "requests"
     responses_dir = web / "responses"
+    provenance_dir = web / "provenance"
     profile = web / "browser-profile"
-    for directory in (requests_dir, responses_dir, profile):
+    for directory in (requests_dir, responses_dir, provenance_dir, profile):
         directory.mkdir(parents=True, exist_ok=True)
     cookies = web / "cookies.json"
     coverage = web / "coverage.json"
@@ -71,6 +72,7 @@ def init_web_state(workspace: Path) -> dict[str, str]:
         "coverage": str(coverage),
         "requests_dir": str(requests_dir),
         "responses_dir": str(responses_dir),
+        "provenance_dir": str(provenance_dir),
         "capabilities": str(capabilities),
     }
 

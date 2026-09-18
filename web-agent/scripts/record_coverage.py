@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from init_web_state import WebStateError, init_web_state, session_workspace
+from web_provenance import validate_response_provenance
 
 
 STATES = {"untested", "tested", "promising", "confirmed", "discarded"}
@@ -85,10 +86,7 @@ def _under(path: Path, root: Path) -> bool:
 def _evidence_path(evidence: Path | None, workspace: Path) -> str:
     if evidence is None:
         raise WebStateError("confirmed coverage requires an evidence path")
-    resolved = evidence.expanduser().resolve()
-    if not resolved.is_file() or not _under(resolved, workspace / "web" / "responses"):
-        raise WebStateError("confirmed evidence must be a response file in this web session")
-    return str(resolved)
+    return str(validate_response_provenance(workspace, evidence)["response"])
 
 
 def record_coverage(
