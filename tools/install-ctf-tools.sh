@@ -129,7 +129,7 @@ write_managed_env() {
   mkdir -p "$MANAGED_ROOT" || return 1
   printf -v quoted_bin '%q' "$MANAGED_BIN"
   printf -v quoted_lib '%q' "$MANAGED_ROOT/lib"
-  printf '%s\n' '#!/usr/bin/env bash' "export PATH=${quoted_bin}:\"\${PATH}\"" "export LD_LIBRARY_PATH=${quoted_lib}:\"\${LD_LIBRARY_PATH:-}\"" > "$ENV_FILE"
+  printf '%s\n' '#!/usr/bin/env bash' "export PATH=${quoted_bin}:\"\${PATH}\"" 'if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then' "  export LD_LIBRARY_PATH=${quoted_lib}:\"\${LD_LIBRARY_PATH}\"" 'else' "  export LD_LIBRARY_PATH=${quoted_lib}" 'fi' > "$ENV_FILE"
   chmod +x "$ENV_FILE"
 }
 

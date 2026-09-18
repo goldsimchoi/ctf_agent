@@ -426,9 +426,19 @@ class ToolScriptTests(unittest.TestCase):
             sourced = self.run_command("bash", "-c", '. "$1"; printf %s "$PATH"', "bash", str(env_file))
             self.assertEqual(sourced.returncode, 0, sourced.stderr)
             self.assertTrue(sourced.stdout.startswith(f"{ctf_root / '.tools' / 'bin'}:"))
-            libraries = self.run_command("bash", "-c", '. "$1"; printf %s "$LD_LIBRARY_PATH"', "bash", str(env_file))
-            self.assertEqual(libraries.returncode, 0, libraries.stderr)
-            self.assertTrue(libraries.stdout.startswith(f"{ctf_root / '.tools' / 'lib'}:"))
+            managed_lib = ctf_root / ".tools" / "lib"
+            unset_libraries = self.run_command("bash", "-c", 'unset LD_LIBRARY_PATH; . "$1"; printf %s "${LD_LIBRARY_PATH-}"', "bash", str(env_file))
+            self.assertEqual(unset_libraries.returncode, 0, unset_libraries.stderr)
+            self.assertEqual(unset_libraries.stdout, str(managed_lib))
+            empty_libraries = self.run_command("bash", "-c", 'LD_LIBRARY_PATH=; . "$1"; printf %s "${LD_LIBRARY_PATH-}"', "bash", str(env_file))
+            self.assertEqual(empty_libraries.returncode, 0, empty_libraries.stderr)
+            self.assertEqual(empty_libraries.stdout, str(managed_lib))
+            inherited_libraries = self.run_command(
+                "bash", "-c", '. "$1"; printf %s "${LD_LIBRARY_PATH-}"', "bash", str(env_file),
+                env={"LD_LIBRARY_PATH": "/existing/lib:/another lib"},
+            )
+            self.assertEqual(inherited_libraries.returncode, 0, inherited_libraries.stderr)
+            self.assertEqual(inherited_libraries.stdout, f"{managed_lib}:/existing/lib:/another lib")
             self.assertFalse(sentinel.exists())
 
     def test_installer_rejects_newline_in_managed_environment_root(self) -> None:
@@ -481,7 +491,7 @@ class ToolScriptTests(unittest.TestCase):
             managed_lib.mkdir()
             self.write_executable(
                 managed_bin / "radare2",
-                f'[ "$LD_LIBRARY_PATH" = "{managed_lib}:" ] || exit 127\necho "radare2 5.9.9"',
+                f'[ "$LD_LIBRARY_PATH" = "{managed_lib}" ] || exit 127\necho "radare2 5.9.9"',
             )
             config = temporary_path / "config.toml"
             config.write_text("", encoding="utf-8")
@@ -492,6 +502,7 @@ class ToolScriptTests(unittest.TestCase):
                     "CTF_TOOLS_VENV": str(temporary_path / "missing-venv"),
                     "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
                     "CTF_TOOLS_PLAYWRIGHT_CACHE": str(temporary_path / "missing-cache"),
+                    "LD_LIBRARY_PATH": "",
                 }
             )
         self.assertEqual(report["cli"]["radare2"]["status"], "available")

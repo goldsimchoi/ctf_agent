@@ -81,7 +81,9 @@ def cli(name):
     arguments, pattern = CLI_SPECS[name]
     probe_env = None
     if source == "managed .tools" and name == "radare2":
-        probe_env = {**os.environ, "LD_LIBRARY_PATH": f"{MANAGED_LIB}:{os.environ.get('LD_LIBRARY_PATH', '')}"}
+        existing_library_path = os.environ.get("LD_LIBRARY_PATH", "")
+        probe_library_path = str(MANAGED_LIB) if not existing_library_path else f"{MANAGED_LIB}:{existing_library_path}"
+        probe_env = {**os.environ, "LD_LIBRARY_PATH": probe_library_path}
     version, error = run_probe([path, *arguments], pattern, env=probe_env)
     if error:
         label = "ProjectDiscovery httpx" if name == "httpx" else name
