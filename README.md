@@ -1,30 +1,74 @@
 # ctf_agent
 
-Codex skill and supporting design documents for solving authorized CTF pwnable challenges.
+Codex skills and deterministic helpers for authorized CTF pwn, web, and
+reversing challenges on this Ubuntu notebook.
 
-## Contents
+## Layout
 
-- `pwn-agent/`: installable Codex skill, scripts, references, and templates
-- `docs/specs/`: original agent design
-- `docs/plans/`: debugger integration plan
-- `tests/`: deterministic tests for the skill scripts
+Place source artifacts under the exact event layout; challenge inputs stay
+read-only:
 
-## Install
-
-Copy `pwn-agent` into your Codex skills directory:
-
-```powershell
-Copy-Item -Recurse .\pwn-agent "$env:USERPROFILE\.codex\skills\pwn-agent"
+```text
+/home/normalone/CTF/<event>/challenges/<challenge>/
 ```
 
-The runtime reference contains local IDA, WSL, and pwndbg paths from the environment for which this skill was built. Adjust those paths before using the skill on another machine.
+Each initialization creates a separate run under:
+
+```text
+/home/normalone/CTF/<event>/runs/<category>/<slug>-<fingerprint12>/
+├── shared/findings/<session-id>/       # immutable, evidence-backed facts
+└── sessions/<session-id>/              # private state, logs, artifacts, profiles
+```
+
+Sessions never share mutable state. A later session may read matching immutable
+findings, but it must not treat old hypotheses as facts.
+
+## Install and check capabilities
+
+From this repository on Ubuntu, bootstrap the fixed managed Python environment
+and native tooling:
+
+```bash
+bash tools/install-ctf-tools.sh
+bash tools/check-ctf-tools.sh
+```
+
+The installer creates `/home/normalone/CTF/.venv` with uv-managed Python 3.12,
+plus Python analysis/browser packages and available native tools. It does not
+alter existing `gdb` or `idalib` MCP configuration. Preview the commands
+without changing the host with `bash tools/install-ctf-tools.sh --dry-run`.
+
+The checker always writes one JSON capability document. A `degraded` item has a
+specific reason and a safe fallback, so unavailable optional scanners or
+accelerators do not become silent failures.
+
+## Use the skills
+
+Install `pwn-agent`, `web-agent`, `rev-agent`, and `ctf-common` as sibling
+Codex skills/support directories, then give Codex the authorized artifact or
+manifest-scoped endpoint. Typical prompts are:
+
+```text
+Use $pwn-agent to solve this authorized pwn challenge and return a verified flag.
+Use $web-agent to solve this authorized web challenge and return a verified flag.
+Use $rev-agent to solve this authorized reversing challenge and return a verified flag.
+```
+
+The default `race` mode reports the first source-attributable, non-echoed flag
+with its evidence. Set `mode: strict` in `challenge.yaml` only when two fresh
+clean reproductions are required. Agents record evidence in their own session
+and publish reusable facts solely through immutable `shared/findings/` files.
 
 ## Test
 
-```powershell
-python -m unittest discover -s tests -v
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_tool_scripts -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
 
 ## Safety
 
-Use this skill only with user-supplied challenge artifacts and explicitly authorized CTF endpoints. Challenge binaries, flags, transcripts, debugger databases, and run workspaces are intentionally not included in this repository.
+Use these skills only with user-supplied challenge artifacts and explicitly
+authorized CTF endpoints. They must not scan targets outside the resolved
+manifest scope. Challenge binaries, flags, transcripts, debugger databases,
+and session workspaces are intentionally not included in this repository.
