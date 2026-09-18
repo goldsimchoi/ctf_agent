@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -29,12 +30,15 @@ from ctf_workspace import (  # noqa: E402
 )
 
 
-def run_common_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
+def run_common_script(
+    name: str, *args: str, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SCRIPTS_DIR / name), *args],
         text=True,
         capture_output=True,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -173,6 +177,26 @@ class CommonWorkspaceTests(unittest.TestCase):
         destination = row["workspace"].parents[1] / "shared" / "findings" / row["session_id"]
         self.assertFalse(destination.exists())
 
+    def test_publish_cli_rejects_fifo_evidence_without_blocking(self) -> None:
+        row = create_session(self.challenge, "web")
+        evidence = row["workspace"] / "artifacts" / "stream"
+        os.mkfifo(evidence)
+
+        try:
+            result = run_common_script(
+                "publish_finding.py",
+                "--workspace", str(row["workspace"]),
+                "--kind", "endpoint",
+                "--evidence", str(evidence),
+                "--summary", "fifo evidence",
+                timeout=1,
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("publishing blocked on FIFO evidence")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["status"], "error")
+
     def test_initializer_rejects_symlinked_sessions_component(self) -> None:
         row = create_session(self.challenge, "web")
         sessions = row["workspace"].parent
@@ -235,6 +259,33 @@ class CommonWorkspaceTests(unittest.TestCase):
         self.assertEqual(race["status"], "verified")
         self.assertEqual(race["flag"], "FLAG{real}")
         self.assertEqual(strict["reason"], "requires_two_clean_reproductions")
+
+    def test_verifier_rejects_fifo_capture_artifacts_without_blocking(self) -> None:
+        for artifact in ("output", "sent", "attestation"):
+            with self.subTest(artifact=artifact):
+                row = create_session(self.challenge, "web")
+                output, sent, attestation = self.make_capture(row, "capture-one", b"FLAG{fifo}\n")
+                fifo = {"output": output, "sent": sent, "attestation": attestation}[artifact]
+                fifo.unlink()
+                os.mkfifo(fifo)
+
+                try:
+                    result = run_common_script(
+                        "verify_flag.py",
+                        "--workspace", str(row["workspace"]),
+                        "--output", str(output),
+                        "--sent", str(sent),
+                        "--attestation", str(attestation),
+                        "--pattern", r"FLAG\{[^}\r\n]+\}",
+                        timeout=1,
+                    )
+                except subprocess.TimeoutExpired:
+                    self.fail(f"verification blocked on FIFO {artifact}")
+
+                self.assertEqual(result.returncode, 2)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["status"], "candidate_only")
+                self.assertEqual(payload["reason"], "invalid_capture_attestation")
 
     def test_verifier_rejects_more_than_sixteen_capture_paths(self) -> None:
         row = create_session(self.challenge, "web")
@@ -495,6 +546,46 @@ class CommonWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(next_row["findings"], [])
         self.assertEqual(next_row["skipped_findings"]["reasons"], {"evidence_missing": 1})
+
+    def test_initializer_skips_fifo_shared_finding_record_without_blocking(self) -> None:
+        row = create_session(self.challenge, "web")
+        evidence = row["workspace"] / "artifacts" / "response.txt"
+        evidence.write_bytes(b"original")
+        finding = publish_finding(row["workspace"], "endpoint", evidence, "verified endpoint")
+        finding.unlink()
+        os.mkfifo(finding)
+
+        try:
+            result = run_common_script(
+                "init_session.py", str(self.challenge), "--category", "web", timeout=1
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("finding indexing blocked on FIFO record")
+
+        self.assertEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["skipped_findings"]["reasons"], {"malformed_record": 1})
+
+    def test_initializer_skips_fifo_shared_finding_evidence_without_blocking(self) -> None:
+        row = create_session(self.challenge, "web")
+        evidence = row["workspace"] / "artifacts" / "response.txt"
+        evidence.write_bytes(b"original")
+        finding = publish_finding(row["workspace"], "endpoint", evidence, "verified endpoint")
+        payload = json.loads(finding.read_text(encoding="utf-8"))
+        shared_evidence = Path(payload["evidence"])
+        shared_evidence.unlink()
+        os.mkfifo(shared_evidence)
+
+        try:
+            result = run_common_script(
+                "init_session.py", str(self.challenge), "--category", "web", timeout=1
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("finding indexing blocked on FIFO evidence")
+
+        self.assertEqual(result.returncode, 0)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["skipped_findings"]["reasons"], {"evidence_missing": 1})
 
     def test_initializer_skips_path_escaping_shared_finding_record(self) -> None:
         row = create_session(self.challenge, "web")

@@ -183,7 +183,9 @@ def _read_regular_under(
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
-        file_descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+        file_descriptor = os.open(
+            parts[-1], os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=descriptor
+        )
         metadata = os.fstat(file_descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise InvalidInput(f"{description} is not a regular file: {raw}")
