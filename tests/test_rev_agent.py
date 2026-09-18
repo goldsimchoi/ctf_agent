@@ -514,31 +514,47 @@ class RevAgentTests(unittest.TestCase):
                 ["contradiction", "--workspace", str(workspace), "--hypothesis-id", base["id"],
                  "--evidence", "gdb/lock-conflict.txt", "--summary", "conflict"],
             ]
+            processes: list[subprocess.Popen[str]] = []
+            queued = False
             with lock_path.open("a+", encoding="utf-8") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                inode = lock_path.stat().st_ino
-                processes = [
-                    subprocess.Popen(
-                        [sys.executable, str(SCRIPTS / "record_clue.py"), *command],
-                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    )
-                    for command in commands
-                ]
-                deadline = time.monotonic() + 3
-                observed: set[int] = set()
-                while time.monotonic() < deadline:
-                    locks = Path("/proc/locks").read_text(encoding="utf-8")
-                    for process in processes:
-                        if process.poll() is None and any(
-                            "-> FLOCK" in line and f" {process.pid} " in line and f":{inode} " in line
-                            for line in locks.splitlines()
-                        ):
-                            observed.add(process.pid)
-                    if len(observed) == len(processes):
-                        break
-                    time.sleep(0.01)
-                self.assertEqual(observed, {process.pid for process in processes})
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                try:
+                    inode = lock_path.stat().st_ino
+                    processes = [
+                        subprocess.Popen(
+                            [sys.executable, str(SCRIPTS / "record_clue.py"), *command],
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        )
+                        for command in commands
+                    ]
+                    deadline = time.monotonic() + 3
+                    observed: set[int] = set()
+                    while time.monotonic() < deadline:
+                        locks = Path("/proc/locks").read_text(encoding="utf-8")
+                        for process in processes:
+                            if process.poll() is None and any(
+                                "-> FLOCK" in line and f" {process.pid} " in line and f":{inode} " in line
+                                for line in locks.splitlines()
+                            ):
+                                observed.add(process.pid)
+                        if len(observed) == len(processes):
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(observed, {process.pid for process in processes})
+                    queued = True
+                finally:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    if not queued:
+                        for process in processes:
+                            if process.poll() is None:
+                                process.terminate()
+                        for process in processes:
+                            try:
+                                process.communicate(timeout=1)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.communicate(timeout=1)
+                            process.wait(timeout=1)
             results = [process.communicate(timeout=3) for process in processes]
             self.assertTrue(all(process.returncode == 0 for process in processes), results)
             ledger = json.loads((workspace / "rev" / "hypotheses.json").read_text())["hypotheses"][0]
