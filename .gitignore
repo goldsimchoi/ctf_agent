@@ -17,3 +17,5 @@ logs/
 flag
 flag.txt
 ctf_agent_publish/
+.worktrees/
+.superpowers/
