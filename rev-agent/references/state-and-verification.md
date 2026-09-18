@@ -21,6 +21,15 @@ python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
   --sent <workspace>/rev/oracle/oracle.sent
 ```
 
-Race mode accepts one clean target result; strict mode needs two clean outputs
-with `--strict`. Do not submit a candidate merely because a decompiler suggests
-the algorithm.
+`solver.py --verify` performs one race-mode check only. Strict verification
+requires at least two independently captured output/sent pairs through the
+common verifier:
+
+```text
+python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
+  --output <workspace>/rev/oracle/run1.out --sent <workspace>/rev/oracle/run1.sent \
+  --output <workspace>/rev/oracle/run2.out --sent <workspace>/rev/oracle/run2.sent \
+  --strict
+```
+
+Do not submit a candidate merely because a decompiler suggests the algorithm.

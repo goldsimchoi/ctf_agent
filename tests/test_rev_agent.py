@@ -184,6 +184,65 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(payload["verification"]["status"], "unverified")
             self.assertEqual(payload["verification"]["reason"], "candidate_was_user_input")
 
+    def test_oracle_rejects_colliding_evidence_paths_before_running_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-oracle-collision")
+            init_rev_state(workspace)
+            ran = root / "target-ran"
+            target = root / "target.py"
+            target.write_text(
+                "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                f"Path({str(ran)!r}).write_text('ran')\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+            oracle = workspace / "rev" / "oracle"
+            for output, sent in ((oracle / "shared.out", oracle / "shared.out"), (oracle / "derived.sent", None)):
+                with self.subTest(output=output.name):
+                    output.write_text("preserve me\n", encoding="utf-8")
+                    command = [
+                        SKILL_DIR / "assets" / "solver.py",
+                        "--workspace", str(workspace),
+                        "--binary", str(target),
+                        "--candidate", "candidate",
+                        "--output", str(output),
+                    ]
+                    if sent is not None:
+                        command.extend(("--sent", str(sent)))
+                    result = run_script(*command)
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("must differ", json.loads(result.stdout)["error"])
+                    self.assertEqual(output.read_text(encoding="utf-8"), "preserve me\n")
+                    self.assertFalse(ran.exists())
+
+    def test_oracle_does_not_accept_single_run_strict_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-oracle-strict")
+            init_rev_state(workspace)
+            ran = root / "target-ran"
+            target = root / "target.py"
+            target.write_text(
+                "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                f"Path({str(ran)!r}).write_text('ran')\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+
+            result = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace),
+                "--binary", str(target),
+                "--candidate", "candidate",
+                "--strict",
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--strict", result.stderr)
+            self.assertFalse(ran.exists())
+
     def test_state_cli_records_hypothesis_experiment_and_bidirectional_contradiction(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             workspace = self.make_workspace(Path(temp), "rev-state-cli")

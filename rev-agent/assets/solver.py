@@ -61,6 +61,8 @@ def run_oracle(
     sent = sent.expanduser().resolve()
     if not under(sent, oracle):
         raise ValueError("oracle sent input must be inside this session's rev/oracle directory")
+    if output == sent:
+        raise ValueError("oracle output and sent input paths must differ")
     sent.parent.mkdir(parents=True, exist_ok=True)
     sent.write_text(candidate + "\n", encoding="utf-8")
     try:
@@ -92,7 +94,7 @@ def run_oracle(
     }
 
 
-def verify_oracle(workspace: Path, output: Path, sent: Path, strict: bool) -> tuple[int, dict[str, object]]:
+def verify_oracle(workspace: Path, output: Path, sent: Path) -> tuple[int, dict[str, object]]:
     """Delegate oracle verification to the shared echo-aware verifier."""
     command = [
         sys.executable,
@@ -101,8 +103,6 @@ def verify_oracle(workspace: Path, output: Path, sent: Path, strict: bool) -> tu
         "--output", str(output),
         "--sent", str(sent),
     ]
-    if strict:
-        command.append("--strict")
     result = subprocess.run(command, text=True, capture_output=True, check=False)
     try:
         payload = json.loads(result.stdout)
@@ -120,18 +120,13 @@ def main() -> int:
     parser.add_argument("--sent", type=Path)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--verify", action="store_true")
-    parser.add_argument("--strict", action="store_true")
     try:
         args = parser.parse_args()
-        if args.strict and not args.verify:
-            raise ValueError("--strict requires --verify")
         result = run_oracle(
             args.workspace, args.binary, args.candidate, args.output, args.timeout, args.sent
         )
         if args.verify:
-            code, verification = verify_oracle(
-                args.workspace, Path(result["output"]), Path(result["sent"]), args.strict
-            )
+            code, verification = verify_oracle(args.workspace, Path(result["output"]), Path(result["sent"]))
             result["verification"] = verification
             print(json.dumps(result, ensure_ascii=False))
             return code
