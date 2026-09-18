@@ -13,15 +13,24 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output", type=Path, action="append", required=True)
     parser.add_argument("--sent", type=Path, action="append", default=[])
+    parser.add_argument("--attestation", type=Path, action="append", default=[])
     parser.add_argument("--pattern", action="append", default=[])
     parser.add_argument("--strict", action="store_true")
     try:
         args = parser.parse_args()
-        if not args.workspace.expanduser().resolve().is_dir():
-            raise InvalidInput(f"workspace is not a directory: {args.workspace}")
         patterns = tuple(item.encode("utf-8") for item in args.pattern) or DEFAULT_PATTERNS
-        result = verify_outputs(args.output, args.sent, patterns, args.strict)
-    except InvalidInput as exc:
+        attestations = [
+            json.loads(path.read_text(encoding="utf-8")) for path in args.attestation
+        ]
+        result = verify_outputs(
+            args.output,
+            args.sent,
+            patterns,
+            args.strict,
+            workspace=args.workspace,
+            attestations=attestations or None,
+        )
+    except (OSError, json.JSONDecodeError, InvalidInput) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 2
     print(json.dumps(result, ensure_ascii=False))

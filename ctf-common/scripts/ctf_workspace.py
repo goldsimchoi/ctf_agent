@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -70,10 +71,93 @@ def new_session_id(category: str) -> str:
 
 
 def _resolve_directory(path: Path, description: str) -> Path:
-    resolved = path.expanduser().resolve()
-    if not resolved.is_dir():
-        raise InvalidInput(f"{description} is not a directory: {resolved}")
-    return resolved
+    raw = path.expanduser().absolute()
+    _reject_symlink_components(raw)
+    if not raw.is_dir():
+        raise InvalidInput(f"{description} is not a directory: {raw}")
+    return raw
+
+
+def _reject_symlink_components(path: Path) -> None:
+    """Reject a path containing a symlink before using it as a write root."""
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise InvalidInput(f"symlinked path component: {current}")
+        except OSError as exc:
+            raise InvalidInput(f"unusable path component: {current}") from exc
+
+
+def _safe_file(path: Path, description: str) -> Path:
+    raw = path.expanduser().absolute()
+    _reject_symlink_components(raw)
+    try:
+        mode = raw.stat().st_mode
+    except OSError as exc:
+        raise InvalidInput(f"{description} is not readable: {raw}") from exc
+    if not stat.S_ISREG(mode):
+        raise InvalidInput(f"{description} is not a regular file: {raw}")
+    return raw
+
+
+def _open_directory_nofollow(path: Path) -> int:
+    """Open every directory component through directory FDs without following links."""
+    raw = _resolve_directory(path, "workspace directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open(raw.anchor, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in raw.parts[1:]:
+            child = os.open(part, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _safe_directory(root: Path, *parts: str) -> Path:
+    """Create/check directory components without following a symlink component."""
+    current = _resolve_directory(root, "workspace root")
+    descriptor = _open_directory_nofollow(current)
+    try:
+        for part in parts:
+            _validate_explicit_id(part)
+            candidate = current / part
+            try:
+                os.mkdir(part, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise InvalidInput(f"cannot create workspace component: {candidate}") from exc
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            except OSError as exc:
+                raise InvalidInput(f"workspace component is not a directory: {candidate}") from exc
+            os.close(descriptor)
+            descriptor = child
+            current = candidate
+    finally:
+        os.close(descriptor)
+    return current
+
+
+def _create_session_directory(sessions: Path, identifier: str) -> Path:
+    _reject_symlink_components(sessions)
+    if not sessions.is_dir():
+        raise InvalidInput(f"sessions path is not a directory: {sessions}")
+    destination = sessions / identifier
+    descriptor = _open_directory_nofollow(sessions)
+    try:
+        os.mkdir(identifier, dir_fd=descriptor)
+    except FileExistsError as exc:
+        raise CollisionError(f"session already exists: {destination}") from exc
+    finally:
+        os.close(descriptor)
+    _reject_symlink_components(destination)
+    return destination
 
 
 def _under(path: Path, root: Path) -> bool:
@@ -129,81 +213,80 @@ def challenge_fingerprint(challenge: Path) -> str:
     return digest.hexdigest()
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+def _atomic_replace(path: Path, content: bytes) -> None:
+    """Atomically replace a file through a no-follow directory descriptor."""
+    descriptor = _open_directory_nofollow(path.parent)
+    temporary = f".{path.name}.{secrets.token_hex(8)}.tmp"
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True, ensure_ascii=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-        raise
-
-
-def _atomic_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        file_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=descriptor,
+        )
+        with os.fdopen(file_descriptor, "wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(temporary, path.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
     except BaseException:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=descriptor)
         except FileNotFoundError:
             pass
         raise
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_replace(
+        path,
+        (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"),
+    )
+
+
+def _atomic_text(path: Path, content: str) -> None:
+    _atomic_replace(path, content.encode("utf-8"))
 
 
 def _write_new_json(path: Path, payload: dict[str, Any]) -> None:
     """Atomically publish a new file without allowing a replacement."""
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True, ensure_ascii=False)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, path)
-    except FileExistsError:
-        raise
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
+    _write_new_bytes(
+        path,
+        (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8"),
+    )
 
 
 def _write_new_bytes(path: Path, content: bytes) -> None:
     """Atomically publish immutable binary evidence without replacement."""
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    descriptor = _open_directory_nofollow(path.parent)
+    temporary = f".{path.name}.{secrets.token_hex(8)}.tmp"
     try:
-        with os.fdopen(descriptor, "wb") as stream:
+        file_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=descriptor,
+        )
+        with os.fdopen(file_descriptor, "wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.link(temporary, path)
+        os.link(temporary, path.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
     except FileExistsError:
         raise
     finally:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=descriptor)
         except FileNotFoundError:
             pass
+        os.close(descriptor)
 
 
 def _json_path(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(_safe_file(path, "JSON file").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise InvalidInput(f"invalid state file: {path}") from exc
     if not isinstance(payload, dict):
@@ -215,22 +298,69 @@ def _workspace_root(workspace: Path) -> tuple[Path, Path]:
     workspace = _resolve_directory(workspace, "workspace")
     if workspace.parent.name != "sessions" or not (workspace / "state.json").is_file():
         raise InvalidInput(f"not a session workspace: {workspace}")
-    return workspace, workspace.parent.parent
+    common_root = workspace.parent.parent
+    category_root = common_root.parent
+    runs_root = category_root.parent
+    if category_root.name not in CATEGORIES or runs_root.name != "runs":
+        raise InvalidInput(f"not a canonical session workspace: {workspace}")
+    session = _json_path(workspace / "session.json")
+    expected = {
+        "workspace": str(workspace),
+        "session_id": workspace.name,
+        "category": category_root.name,
+        "event_root": str(runs_root.parent),
+    }
+    if any(session.get(key) != value for key, value in expected.items()):
+        raise InvalidInput(f"session identity does not match workspace path: {workspace}")
+    return workspace, common_root
 
 
-def _finding_paths(common_root: Path) -> list[Path]:
+def _finding_paths(common_root: Path) -> tuple[list[Path], dict[str, Any]]:
     root = common_root / "shared" / "findings"
     if not root.is_dir():
-        return []
+        return [], {"count": 0, "reasons": {}}
     findings: list[Path] = []
+    reasons: dict[str, int] = {}
+
+    def skip(reason: str) -> None:
+        reasons[reason] = reasons.get(reason, 0) + 1
+
     for path in sorted(root.glob("*/*.json")):
         try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            payload = json.loads(_safe_file(path, "finding record").read_text(encoding="utf-8"))
+        except (InvalidInput, OSError, json.JSONDecodeError):
+            skip("malformed_record")
             continue
-        if isinstance(payload, dict) and payload.get("evidence") and payload.get("summary"):
-            findings.append(path)
-    return findings
+        required = {"schema_version", "created_at", "evidence", "evidence_sha256", "kind", "session_id", "summary"}
+        if (
+            not isinstance(payload, dict)
+            or not required.issubset(payload)
+            or payload.get("schema_version") != 1
+        ):
+            skip("malformed_record")
+            continue
+        owner = path.parent
+        if not isinstance(payload["session_id"], str) or payload["session_id"] != owner.name:
+            skip("invalid_finding_owner")
+            continue
+        try:
+            _workspace_root(common_root / "sessions" / owner.name)
+        except InvalidInput:
+            skip("invalid_finding_owner")
+            continue
+        try:
+            evidence = _safe_file(Path(str(payload["evidence"])), "finding evidence")
+        except InvalidInput:
+            skip("evidence_missing")
+            continue
+        if not _under(evidence, owner):
+            skip("evidence_outside_finding")
+            continue
+        if not isinstance(payload["evidence_sha256"], str) or hashlib.sha256(evidence.read_bytes()).hexdigest() != payload["evidence_sha256"]:
+            skip("evidence_digest_mismatch")
+            continue
+        findings.append(path)
+    return findings, {"count": sum(reasons.values()), "reasons": reasons}
 
 
 def create_session(
@@ -247,21 +377,18 @@ def create_session(
     manifest = _manifest_scalars(challenge)
     slug = safe_slug(manifest.get("id", challenge.name))
     fingerprint = challenge_fingerprint(challenge)
-    common_root = root / "runs" / category / f"{slug}-{fingerprint[:12]}"
-    sessions = common_root / "sessions"
-    shared_findings = common_root / "shared" / "findings"
-    sessions.mkdir(parents=True, exist_ok=True)
-    shared_findings.mkdir(parents=True, exist_ok=True)
+    common_root = _safe_directory(root, "runs", category, f"{slug}-{fingerprint[:12]}")
+    sessions = _safe_directory(common_root, "sessions")
+    _safe_directory(common_root, "shared", "findings")
 
     explicit = session_id is not None
     for _ in range(16):
         identifier = _validate_explicit_id(session_id) if explicit else new_session_id(category)
-        workspace = sessions / identifier
         try:
-            workspace.mkdir()
-        except FileExistsError:
+            workspace = _create_session_directory(sessions, identifier)
+        except CollisionError:
             if explicit:
-                raise CollisionError(f"session already exists: {workspace}") from None
+                raise
             continue
         break
     else:
@@ -269,7 +396,7 @@ def create_session(
 
     try:
         for name in ("artifacts", "logs", "transcripts"):
-            (workspace / name).mkdir()
+            _safe_directory(workspace, name)
         started_at = _utc_now().isoformat()
         try:
             wall_time = int(manifest.get("wall_time_seconds", "0"))
@@ -285,6 +412,7 @@ def create_session(
             "fingerprint": fingerprint,
             "session_id": identifier,
             "started_at": started_at,
+            "workspace": str(workspace),
         }
         state = {
             "attempts": [],
@@ -316,13 +444,15 @@ def create_session(
         workspace.rmdir()
         raise
 
+    findings, skipped_findings = _finding_paths(common_root)
     return {
         "workspace": workspace,
         "category": category,
         "challenge_id": slug,
         "fingerprint": fingerprint,
         "session_id": identifier,
-        "findings": _finding_paths(common_root),
+        "findings": findings,
+        "skipped_findings": skipped_findings,
     }
 
 
@@ -332,12 +462,10 @@ def publish_finding(workspace: Path, kind: str, evidence: Path, summary: str) ->
     kind = _validate_explicit_id(kind)
     if not summary.strip():
         raise InvalidInput("finding summary must not be empty")
-    evidence = evidence.expanduser().resolve()
-    if not evidence.is_file() or not _under(evidence, workspace):
+    evidence = _safe_file(evidence, "finding evidence")
+    if not _under(evidence, workspace):
         raise InvalidInput("finding evidence must be a file inside its workspace")
-    session = _json_path(workspace / "session.json")
-    destination = common_root / "shared" / "findings" / str(session["session_id"])
-    destination.mkdir(parents=True, exist_ok=True)
+    destination = _safe_directory(common_root, "shared", "findings", workspace.name)
     content = evidence.read_bytes()
     for _ in range(16):
         stem = f"{_timestamp()}-{secrets.token_hex(4)}"
@@ -347,11 +475,12 @@ def publish_finding(workspace: Path, kind: str, evidence: Path, summary: str) ->
         except FileExistsError:
             continue
         payload = {
+            "schema_version": 1,
             "created_at": _utc_now().isoformat(),
             "evidence": str(evidence_path),
             "evidence_sha256": hashlib.sha256(content).hexdigest(),
             "kind": kind,
-            "session_id": session["session_id"],
+            "session_id": workspace.name,
             "summary": summary.strip(),
         }
         path = destination / f"{stem}.json"
@@ -430,21 +559,114 @@ def _candidates(data: bytes, patterns: tuple[bytes, ...]) -> set[bytes]:
     return found
 
 
+def _candidate_only(reason: str, candidates: set[bytes]) -> dict[str, Any]:
+    candidate = min(candidates, key=lambda item: (len(item), item)) if candidates else None
+    return {
+        "status": "candidate_only",
+        "reason": reason,
+        "candidate": candidate.decode("utf-8", errors="replace") if candidate else None,
+        "flag": None,
+        "reproductions": 0,
+    }
+
+
+def _validate_capture_attestations(
+    workspace: Path | None,
+    outputs: list[Path],
+    sent: list[Path],
+    attestations: list[dict[str, Any]] | None,
+) -> tuple[list[Path], list[Path], str | None]:
+    """Validate capture provenance before a candidate can become a flag."""
+    if workspace is None or attestations is None:
+        return [], [], "missing_capture_attestation"
+    try:
+        workspace, _ = _workspace_root(workspace)
+        session = _json_path(workspace / "session.json")
+    except InvalidInput:
+        return [], [], "invalid_capture_attestation"
+    if not sent:
+        return [], [], "missing_sent_evidence"
+    if len(outputs) != len(attestations):
+        return [], [], "invalid_capture_attestation"
+    try:
+        safe_sent = [_safe_file(path, "sent evidence") for path in sent]
+        safe_outputs = [_safe_file(path, "capture output") for path in outputs]
+    except InvalidInput:
+        return [], [], "invalid_capture_attestation"
+    if any(not _under(path, workspace) for path in safe_sent + safe_outputs):
+        return [], [], "invalid_capture_attestation"
+    sent_by_path = {str(path): path for path in safe_sent}
+    seen_paths: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_attestations: set[str] = set()
+    source_targets: set[str] = set()
+    for output, attestation in zip(safe_outputs, attestations, strict=True):
+        if not isinstance(attestation, dict):
+            return [], [], "invalid_capture_attestation"
+        try:
+            capture_id = _validate_explicit_id(str(attestation["capture_id"]))
+            output_record = attestation["output"]
+            sent_record = attestation["sent"]
+            if not isinstance(output_record, dict) or not isinstance(sent_record, dict):
+                raise InvalidInput("capture record must describe output and sent evidence")
+            target = attestation["source_target"]
+            if not isinstance(target, str) or not target.strip():
+                raise InvalidInput("capture attestation needs source target")
+            if (
+                attestation.get("schema_version") != 1
+                or attestation.get("workspace") != str(workspace)
+                or attestation.get("session_id") != session["session_id"]
+                or attestation.get("category") != session["category"]
+                or output_record.get("path") != str(output)
+                or output_record.get("sha256") != hashlib.sha256(output.read_bytes()).hexdigest()
+            ):
+                raise InvalidInput("capture attestation does not match output")
+            sent_path = _safe_file(Path(str(sent_record["path"])), "attested sent evidence")
+            if (
+                str(sent_path) not in sent_by_path
+                or not _under(sent_path, workspace)
+                or sent_record.get("sha256") != hashlib.sha256(sent_path.read_bytes()).hexdigest()
+            ):
+                raise InvalidInput("capture attestation does not match sent evidence")
+        except (InvalidInput, KeyError, TypeError):
+            return [], [], "invalid_capture_attestation"
+        attestation_key = json.dumps(attestation, sort_keys=True, separators=(",", ":"))
+        if str(output) in seen_paths or capture_id in seen_ids or attestation_key in seen_attestations:
+            return [], [], "duplicate_capture_attestation"
+        seen_paths.add(str(output))
+        seen_ids.add(capture_id)
+        seen_attestations.add(attestation_key)
+        source_targets.add(target.strip())
+    if len(source_targets) != 1:
+        return [], [], "capture_source_target_mismatch"
+    return safe_outputs, safe_sent, None
+
+
 def verify_outputs(
-    outputs: list[Path], sent: list[Path], patterns: tuple[bytes, ...], strict: bool
+    outputs: list[Path],
+    sent: list[Path],
+    patterns: tuple[bytes, ...],
+    strict: bool,
+    workspace: Path | None = None,
+    attestations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Verify attributable candidates once (race) or twice (strict), never echoes."""
+    """Verify attested target captures once (race) or twice (strict), never echoes."""
     if not outputs:
         raise InvalidInput("at least one output is required")
     try:
-        output_data = [path.expanduser().resolve().read_bytes() for path in outputs]
-        sent_data = b"\n".join(path.expanduser().resolve().read_bytes() for path in sent)
+        output_data = [_safe_file(path, "output").read_bytes() for path in outputs]
         per_output = [_candidates(data, patterns) for data in output_data]
     except (OSError, re.error) as exc:
         raise InvalidInput(str(exc)) from exc
+    candidates = set().union(*per_output)
+    safe_outputs, safe_sent, attestation_error = _validate_capture_attestations(
+        workspace, outputs, sent, attestations
+    )
+    if attestation_error:
+        return _candidate_only(attestation_error, candidates)
+    sent_data = b"\n".join(path.read_bytes() for path in safe_sent)
     if strict and len(outputs) < 2:
         return {"status": "unverified", "reason": "requires_two_clean_reproductions", "flag": None, "reproductions": 0}
-    candidates = set().union(*per_output)
     if not candidates:
         return {
             "status": "unverified",
