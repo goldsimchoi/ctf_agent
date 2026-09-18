@@ -23,10 +23,16 @@
    only with the common finding CLI.
 
 ```text
+python3 <skill>/scripts/record_clue.py hypothesis --workspace <workspace> \
+  --statement '<claim>' --falsifying-test '<disproof test>'
+python3 <skill>/scripts/record_clue.py experiment --workspace <workspace> \
+  --hypothesis-id hypothesis-0001 --evidence gdb/trace.txt --result '<outcome>'
+python3 <skill>/scripts/record_clue.py contradiction --workspace <workspace> \
+  --hypothesis-id hypothesis-0001 --evidence gdb/alternate.txt --summary '<conflict>'
 python3 <ctf-common>/scripts/record_attempt.py --workspace <workspace> \
   --signature '<candidate or runtime test>' --progress 'new clue: <detail>'
 python3 <skill>/assets/solver.py --workspace <workspace> --binary <binary> \
-  --candidate '<candidate>' --output <workspace>/rev/oracle/oracle.out
+  --candidate '<candidate>' --output <workspace>/rev/oracle/oracle.out --verify
 ```
 
 The lead solver owns its session. A short-lived explorer, when necessary for a

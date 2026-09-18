@@ -35,7 +35,7 @@ points, and one controlled execution. Record every material clue with its
 evidence, xrefs, functions, and cheapest discriminating next action:
 
 ```text
-python3 <skill>/scripts/record_clue.py --workspace <workspace> \
+python3 <skill>/scripts/record_clue.py clue --workspace <workspace> \
   --evidence artifacts/strings.txt --summary 'candidate compare constant' \
   --xref 0x4012ab --function check_input \
   --next-action 'trace input bytes to final comparison'

@@ -156,6 +156,74 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(payload["returncode"], 0)
             self.assertEqual(output.read_text(encoding="utf-8"), "accepted:flag{oracle}\n")
 
+    def test_oracle_saves_sent_input_and_rejects_an_echoed_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-oracle-echo")
+            init_rev_state(workspace)
+            target = Path(temp) / "echo.py"
+            target.write_text(
+                "#!/usr/bin/env python3\nimport sys\nprint(sys.stdin.read().strip())\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+
+            result = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace),
+                "--binary", str(target),
+                "--candidate", "FLAG{echoed}",
+                "--verify",
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(result.stdout)
+            sent = Path(payload["sent"])
+            self.assertTrue(sent.is_file())
+            self.assertTrue(sent.is_relative_to(workspace / "rev" / "oracle"))
+            self.assertEqual(sent.read_text(encoding="utf-8"), "FLAG{echoed}\n")
+            self.assertEqual(payload["verification"]["status"], "unverified")
+            self.assertEqual(payload["verification"]["reason"], "candidate_was_user_input")
+
+    def test_state_cli_records_hypothesis_experiment_and_bidirectional_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-state-cli")
+            hypothesis_result = run_script(
+                SCRIPTS / "record_clue.py",
+                "hypothesis",
+                "--workspace", str(workspace),
+                "--statement", "the compare is reachable from main",
+                "--falsifying-test", "break at the compare after valid input",
+            )
+            self.assertEqual(hypothesis_result.returncode, 0, hypothesis_result.stderr)
+            hypothesis = json.loads(hypothesis_result.stdout)
+            experiment_result = run_script(
+                SCRIPTS / "record_clue.py",
+                "experiment",
+                "--workspace", str(workspace),
+                "--hypothesis-id", hypothesis["id"],
+                "--evidence", "gdb/reachable.txt",
+                "--result", "breakpoint reached",
+                "--progress",
+            )
+            self.assertEqual(experiment_result.returncode, 0, experiment_result.stderr)
+            self.assertEqual(json.loads(experiment_result.stdout)["status"], "active")
+            contradiction_result = run_script(
+                SCRIPTS / "record_clue.py",
+                "contradiction",
+                "--workspace", str(workspace),
+                "--hypothesis-id", hypothesis["id"],
+                "--evidence", "gdb/alternate-path.txt",
+                "--summary", "a second path bypasses the comparison",
+            )
+            self.assertEqual(contradiction_result.returncode, 0, contradiction_result.stderr)
+            contradiction = json.loads(contradiction_result.stdout)
+
+            hypotheses = json.loads((workspace / "rev" / "hypotheses.json").read_text())
+            contradictions = json.loads((workspace / "rev" / "contradictions.json").read_text())
+            self.assertEqual(contradiction["hypothesis_id"], hypothesis["id"])
+            self.assertEqual(hypotheses["hypotheses"][0]["contradiction_ids"], [contradiction["id"]])
+            self.assertEqual(contradictions["contradictions"], [contradiction])
+
 
 if __name__ == "__main__":
     unittest.main()

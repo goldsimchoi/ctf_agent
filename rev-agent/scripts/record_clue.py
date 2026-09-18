@@ -199,17 +199,46 @@ def record_contradiction(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--evidence", required=True)
-    parser.add_argument("--summary", required=True)
-    parser.add_argument("--xref", action="append", default=[])
-    parser.add_argument("--function", dest="functions", action="append", default=[])
-    parser.add_argument("--next-action", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    clue = commands.add_parser("clue")
+    clue.add_argument("--workspace", type=Path, required=True)
+    clue.add_argument("--evidence", required=True)
+    clue.add_argument("--summary", required=True)
+    clue.add_argument("--xref", action="append", default=[])
+    clue.add_argument("--function", dest="functions", action="append", default=[])
+    clue.add_argument("--next-action", required=True)
+    hypothesis = commands.add_parser("hypothesis")
+    hypothesis.add_argument("--workspace", type=Path, required=True)
+    hypothesis.add_argument("--statement", required=True)
+    hypothesis.add_argument("--falsifying-test", required=True)
+    experiment = commands.add_parser("experiment")
+    experiment.add_argument("--workspace", type=Path, required=True)
+    experiment.add_argument("--hypothesis-id", required=True)
+    experiment.add_argument("--evidence", required=True)
+    experiment.add_argument("--result", required=True)
+    experiment.add_argument("--progress", action="store_true")
+    contradiction = commands.add_parser("contradiction")
+    contradiction.add_argument("--workspace", type=Path, required=True)
+    contradiction.add_argument("--hypothesis-id", required=True)
+    contradiction.add_argument("--evidence", required=True)
+    contradiction.add_argument("--summary", required=True)
     try:
         args = parser.parse_args()
-        result = record_clue(
-            args.workspace, args.evidence, args.summary, args.xref, args.functions, args.next_action
-        )
+        if args.command == "clue":
+            result = record_clue(
+                args.workspace, args.evidence, args.summary,
+                args.xref, args.functions, args.next_action,
+            )
+        elif args.command == "hypothesis":
+            result = record_hypothesis(args.workspace, args.statement, args.falsifying_test)
+        elif args.command == "experiment":
+            result = record_experiment(
+                args.workspace, args.hypothesis_id, args.evidence, args.result, args.progress
+            )
+        else:
+            result = record_contradiction(
+                args.workspace, args.hypothesis_id, args.evidence, args.summary
+            )
     except RevStateError as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 2

@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+
+COMMON = Path(__file__).resolve().parents[2] / "ctf-common" / "scripts"
 
 
 def reversing_workspace(workspace: Path) -> Path:
@@ -37,8 +41,9 @@ def run_oracle(
     candidate: str,
     output: Path | None = None,
     timeout: float = 5.0,
+    sent: Path | None = None,
 ) -> dict[str, object]:
-    """Feed one candidate to the target binary and preserve its combined output."""
+    """Feed one candidate to the target binary and preserve both input and output."""
     workspace = reversing_workspace(workspace)
     binary = binary.expanduser().resolve()
     if not binary.is_file() or not binary.stat().st_mode & 0o111:
@@ -51,6 +56,13 @@ def run_oracle(
     output = output.expanduser().resolve()
     if not under(output, oracle):
         raise ValueError("oracle output must be inside this session's rev/oracle directory")
+    if sent is None:
+        sent = output.with_suffix(".sent")
+    sent = sent.expanduser().resolve()
+    if not under(sent, oracle):
+        raise ValueError("oracle sent input must be inside this session's rev/oracle directory")
+    sent.parent.mkdir(parents=True, exist_ok=True)
+    sent.write_text(candidate + "\n", encoding="utf-8")
     try:
         result = subprocess.run(
             [str(binary)],
@@ -74,9 +86,29 @@ def run_oracle(
         "workspace": str(workspace),
         "binary": str(binary),
         "output": str(output),
+        "sent": str(sent),
         "returncode": returncode,
         "timed_out": timed_out,
     }
+
+
+def verify_oracle(workspace: Path, output: Path, sent: Path, strict: bool) -> tuple[int, dict[str, object]]:
+    """Delegate oracle verification to the shared echo-aware verifier."""
+    command = [
+        sys.executable,
+        str(COMMON / "verify_flag.py"),
+        "--workspace", str(workspace),
+        "--output", str(output),
+        "--sent", str(sent),
+    ]
+    if strict:
+        command.append("--strict")
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        payload = {"status": "error", "error": result.stderr.strip() or "invalid verifier response"}
+    return result.returncode, payload
 
 
 def main() -> int:
@@ -85,12 +117,24 @@ def main() -> int:
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--sent", type=Path)
     parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--strict", action="store_true")
     try:
         args = parser.parse_args()
+        if args.strict and not args.verify:
+            raise ValueError("--strict requires --verify")
         result = run_oracle(
-            args.workspace, args.binary, args.candidate, args.output, args.timeout
+            args.workspace, args.binary, args.candidate, args.output, args.timeout, args.sent
         )
+        if args.verify:
+            code, verification = verify_oracle(
+                args.workspace, Path(result["output"]), Path(result["sent"]), args.strict
+            )
+            result["verification"] = verification
+            print(json.dumps(result, ensure_ascii=False))
+            return code
     except (OSError, ValueError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 2

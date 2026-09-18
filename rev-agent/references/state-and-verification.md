@@ -17,7 +17,8 @@ candidate only against target-attributable output with the common verifier:
 
 ```text
 python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
-  --output <workspace>/rev/oracle/oracle.out
+  --output <workspace>/rev/oracle/oracle.out \
+  --sent <workspace>/rev/oracle/oracle.sent
 ```
 
 Race mode accepts one clean target result; strict mode needs two clean outputs
