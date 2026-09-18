@@ -14,6 +14,14 @@ address fields, choose an executable in advance, or write into the input
 directory. The selected skill (`pwn-agent`, `web-agent`, or `rev-agent`) fixes
 the category. All derived configuration is private to the new run/session.
 
+The challenge directory may be any dedicated problem folder beneath
+`/home/normalone/CTF`, including the flat form
+`/home/normalone/CTF/<problem>/`. The deeper
+`/home/normalone/CTF/<event>/challenges/<problem>/` convention remains useful
+for event organization but is not required. The CTF root itself is never a
+challenge directory because it also contains managed tools and unrelated
+problems; separate problems must not be mixed into one input folder.
+
 This extends the existing common session contract. It does not add a separate
 agent execution engine or an NLP service: Codex interprets the request, while
 deterministic helpers validate and bind the normalized target values before any
