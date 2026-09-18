@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import secrets
@@ -181,6 +182,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=10.0)
     parser.add_argument("--progress")
     args = parser.parse_args()
+    history_stream = None
     try:
         workspace = session_workspace(args.workspace)
         origin = authorized_url(workspace, args.url)
@@ -190,6 +192,8 @@ def main() -> int:
         signature = " | ".join((args.method.upper(), args.url, json.dumps(pairs(args.header), sort_keys=True), body))
         record_attempt(workspace, signature, args.progress)
         web = workspace / "web"
+        history_stream = (web / ".history.lock").open("a+", encoding="utf-8")
+        fcntl.flock(history_stream.fileno(), fcntl.LOCK_EX)
         session = load_session(web / "cookies.json")
         request_args: dict[str, object] = {"headers": pairs(args.header), "timeout": args.timeout, "allow_redirects": False, "stream": True}
         if args.data is not None:
@@ -252,6 +256,10 @@ def main() -> int:
             atomic_json(error_file, {"error": str(exc)})
         print(json.dumps({"status": "error", "error": str(exc), "evidence": str(error_file) if error_file.is_file() else None}))
         return 2
+    finally:
+        if history_stream is not None:
+            fcntl.flock(history_stream.fileno(), fcntl.LOCK_UN)
+            history_stream.close()
 
 
 if __name__ == "__main__":

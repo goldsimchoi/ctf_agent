@@ -13,6 +13,11 @@ decoded scan body and bounded sent-history artifact, then publishes the common
 capture attestation immediately. The sent history retains prior session traffic,
 redirect hops, prepared bytes, and supported URL/form/JSON semantic values.
 
+Decoding is incremental and capped at the common artifact limit. Oversized
+entity bodies, trailing compressed data, malformed streams, and unsupported
+content encodings remain recorded but intentionally receive no verification
+attestation.
+
 Use Playwright with Chrome only with `--user-data-dir <workspace>/web/browser-profile`.
 For browser storage or WebSockets, save exported storage/message bytes beneath
 the owning `web/responses/` directory. `ffuf`, `sqlmap`, `httpx`, and `nuclei`

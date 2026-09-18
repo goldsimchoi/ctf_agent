@@ -16,3 +16,7 @@ if it was not present in its capture-time bounded sent-history evidence. Strict
 mode requires two distinct authorized request and capture IDs. Run
 `scripts/verify_web_flag.py`, not the common verifier directly; it validates
 provenance and forwards only the existing common attestation/output/sent trio.
+
+Requests in one session serialize their history transaction so each later
+capture includes earlier submissions. This lock is session-local; separate web
+sessions remain independent.

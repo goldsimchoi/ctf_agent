@@ -2,6 +2,7 @@ import json
 import gzip
 import hashlib
 import http.server
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import tempfile
@@ -131,6 +132,36 @@ class HistoryHandler(http.server.BaseHTTPRequestHandler):
                 self._reply("stored")
             else:
                 self._reply(value)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class EncodingHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        if self.path == "/bomb":
+            body = gzip.compress(b"A" * (4 * 1024 * 1024 + 1), mtime=0)
+            encoding = "gzip"
+        else:
+            body = b"FLAG{unsupported_encoding}"
+            encoding = "br"
+        self.send_response(200)
+        self.send_header("Content-Encoding", encoding)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class BarrierHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = b"ok"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -400,6 +431,61 @@ class WebAgentTests(unittest.TestCase):
             Path(provenance["capture"]["output"]).write_bytes(b"FLAG{tampered}")
 
             self.assertEqual(self.verify(workspace, "--output", captured["response_entity_body"]).returncode, 2)
+
+    def test_oversized_or_unsupported_encoded_body_is_recorded_but_unattested(self) -> None:
+        with local_server(EncodingHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-encoding", origin)
+            self.init_web_state(workspace)
+            bomb = json.loads(self.request(
+                workspace, origin + "/bomb", "--progress", "new fact: compressed expansion"
+            ).stdout)
+            unsupported = json.loads(self.request(
+                workspace, origin + "/unsupported", "--progress", "new fact: unsupported encoding"
+            ).stdout)
+
+            for captured in (bomb, unsupported):
+                provenance = json.loads(Path(captured["provenance"]).read_text(encoding="utf-8"))
+                self.assertIsNone(captured["attestation"])
+                self.assertNotIn("capture", provenance)
+                self.assertEqual(self.verify(workspace, "--output", captured["response_entity_body"]).returncode, 2)
+
+    def test_web_validation_rejects_forged_capture_cross_links(self) -> None:
+        with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            server.external_url = origin
+            workspace = self.make_workspace(Path(temp), "web-links", origin)
+            self.init_web_state(workspace)
+            first = json.loads(self.request(workspace, origin + "/gzip", "--progress", "new fact: first link").stdout)
+            second = json.loads(self.request(workspace, origin + "/gzip", "--progress", "new fact: second link").stdout)
+            provenance_path = Path(first["provenance"])
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            second_record = json.loads(Path(second["provenance"]).read_text(encoding="utf-8"))
+            provenance["request_url"] = origin + "/forged"
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+            bad_url = self.verify(workspace, "--output", first["response_entity_body"])
+            provenance["request_url"] = origin + "/gzip"
+            provenance["capture"]["output"] = second_record["capture"]["output"]
+            provenance["capture"]["output_sha256"] = second_record["capture"]["output_sha256"]
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+            bad_link = self.verify(workspace, "--output", first["response_entity_body"])
+
+            self.assertEqual(json.loads(bad_url.stdout)["status"], "error")
+            self.assertEqual(json.loads(bad_link.stdout)["status"], "error")
+
+    def test_same_session_concurrent_requests_preserve_both_history_entries(self) -> None:
+        with local_server(BarrierHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-concurrent", origin)
+            self.init_web_state(workspace)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(
+                    lambda suffix: self.request(
+                        workspace, origin + "/" + suffix, "--progress", f"new fact: {suffix}"
+                    ),
+                    ("one", "two"),
+                ))
+
+            self.assertTrue(all(result.returncode == 0 for result in results))
+            history = json.loads((workspace / "web" / "history.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(history["requests"]), 2)
 
     def test_request_rejects_target_origin_and_non_web_session_before_traffic(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:

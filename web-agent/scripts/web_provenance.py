@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import gzip
 import hashlib
 import json
 import os
@@ -101,20 +100,40 @@ def atomic_bytes(path: Path, payload: bytes) -> None:
         raise
 
 
-def decode_entity_body(body: bytes, encoding: str | None) -> bytes | None:
+def _bounded_zlib(body: bytes, wbits: int) -> bytes | None:
+    """Decode one compressed stream without allocating beyond the common limit."""
     try:
-        normalized = (encoding or "").lower()
-        if normalized == "gzip":
-            decoded = gzip.decompress(body)
-        elif normalized == "deflate":
-            decoded = zlib.decompress(body)
-        elif normalized in {"", "identity"}:
-            decoded = body
-        else:
+        decoder = zlib.decompressobj(wbits)
+        parts: list[bytes] = []
+        size = 0
+        for offset in range(0, len(body), 64 * 1024):
+            pending = body[offset : offset + 64 * 1024]
+            while pending:
+                block = decoder.decompress(pending, MAX_ARTIFACT_BYTES - size + 1)
+                size += len(block)
+                if size > MAX_ARTIFACT_BYTES:
+                    return None
+                parts.append(block)
+                pending = decoder.unconsumed_tail
+        tail = decoder.flush(MAX_ARTIFACT_BYTES - size + 1)
+        size += len(tail)
+        if size > MAX_ARTIFACT_BYTES or not decoder.eof or decoder.unused_data:
             return None
-    except (OSError, zlib.error):
+        parts.append(tail)
+        return b"".join(parts)
+    except zlib.error:
         return None
-    return decoded if len(decoded) <= MAX_ARTIFACT_BYTES else None
+
+
+def decode_entity_body(body: bytes, encoding: str | None) -> bytes | None:
+    normalized = (encoding or "").lower()
+    if normalized == "gzip":
+        return _bounded_zlib(body, 16 + zlib.MAX_WBITS)
+    if normalized == "deflate":
+        return _bounded_zlib(body, zlib.MAX_WBITS)
+    if normalized in {"", "identity"}:
+        return body if len(body) <= MAX_ARTIFACT_BYTES else None
+    return None
 
 
 def prepared_sent_evidence(prepared_bytes: bytes) -> bytes:
@@ -221,7 +240,9 @@ def validate_response_provenance(workspace: Path, evidence: Path) -> dict:
         output = _read_regular_under(workspace, output_path, "capture output")
         sent = _read_regular_under(workspace, sent_path, "capture sent evidence")
         attestation = _read_regular_under(workspace, attestation_path, "capture attestation")
-    except (InvalidInput, KeyError) as exc:
+        session = json.loads(_read_regular_under(workspace, workspace / "session.json", "web session").data.decode("utf-8"))
+        attestation_record = json.loads(attestation.data.decode("utf-8"))
+    except (InvalidInput, KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise WebStateError("response capture artifacts are invalid") from exc
     if (
         capture.get("output_sha256") != hashlib.sha256(output.data).hexdigest()
@@ -229,4 +250,25 @@ def validate_response_provenance(workspace: Path, evidence: Path) -> dict:
         or capture.get("attestation_sha256") != hashlib.sha256(attestation.data).hexdigest()
     ):
         raise WebStateError("response capture artifacts no longer match provenance")
+    body_capture = record.get("body_capture")
+    if not isinstance(body_capture, dict):
+        raise WebStateError("response provenance body metadata is invalid")
+    decoded = decode_entity_body(evidence_snapshot.data, body_capture.get("content_encoding"))
+    if (
+        decoded is None
+        or decoded != output.data
+        or not isinstance(attestation_record, dict)
+        or attestation_path.name != f"{capture.get('capture_id')}.json"
+        or attestation_record.get("schema_version") != 1
+        or attestation_record.get("workspace") != str(workspace)
+        or attestation_record.get("session_id") != session.get("session_id")
+        or attestation_record.get("category") != "web"
+        or attestation_record.get("capture_id") != capture.get("capture_id")
+        or attestation_record.get("source_target") != record.get("request_url")
+        or attestation_record.get("output", {}).get("path") != str(output.path)
+        or attestation_record.get("output", {}).get("sha256") != hashlib.sha256(output.data).hexdigest()
+        or attestation_record.get("sent", {}).get("path") != str(sent.path)
+        or attestation_record.get("sent", {}).get("sha256") != hashlib.sha256(sent.data).hexdigest()
+    ):
+        raise WebStateError("response capture attestation cross-links are invalid")
     return record
