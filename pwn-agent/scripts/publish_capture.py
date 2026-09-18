@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import stat
+import re
 import sys
 from pathlib import Path
 
@@ -15,37 +15,57 @@ COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "ctf-common" / "scripts"
 sys.path.insert(0, str(COMMON_SCRIPTS))
 
 from ctf_workspace import (  # noqa: E402
-    MAX_ARTIFACT_BYTES,
     CollisionError,
     InvalidInput,
+    _read_regular_under,
     publish_capture_attestation,
 )
 
 
-def contained_regular_file(workspace: Path, path: Path, description: str) -> Path:
-    candidate = path.expanduser().absolute()
-    try:
-        candidate.relative_to(workspace)
-        metadata = candidate.lstat()
-    except (OSError, ValueError) as exc:
-        raise InvalidInput(f"{description} must be a session-contained file") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise InvalidInput(f"{description} must be a regular file")
-    if metadata.st_size > MAX_ARTIFACT_BYTES:
-        raise InvalidInput(f"{description} exceeds {MAX_ARTIFACT_BYTES} bytes")
-    return candidate
+def manifest_scalars(data: bytes) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in data.decode("utf-8", errors="strict").splitlines():
+        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*(?:#.*)?$", line)
+        if match:
+            key, value = match.groups()
+            value = value.strip().strip("'\"")
+            if value and not value.startswith(("[", "{", "|", ">")):
+                values[key] = value
+    return values
 
 
-def digest(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with path.open("rb") as stream:
-        total = 0
-        while block := stream.read(1024 * 1024):
-            total += len(block)
-            if total > MAX_ARTIFACT_BYTES:
-                raise InvalidInput(f"capture artifact exceeds {MAX_ARTIFACT_BYTES} bytes")
-            hasher.update(block)
-    return hasher.hexdigest()
+def bound_source_target(workspace: Path, session: dict[str, object], manifest: dict[str, str], supplied: str) -> str:
+    source_target = supplied.strip()
+    if (
+        manifest.get("authorized") == "true"
+        and manifest.get("network_access") == "agent_allowed"
+        and manifest.get("host")
+        and manifest.get("port")
+    ):
+        protocol = manifest.get("protocol", "tcp")
+        if protocol != "tcp":
+            raise InvalidInput("pwn remote capture requires manifest protocol tcp")
+        try:
+            port = int(manifest["port"])
+        except ValueError as exc:
+            raise InvalidInput("manifest port must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise InvalidInput("manifest port is outside the tcp range")
+        expected = f"tcp://{manifest['host']}:{port}"
+        if source_target == expected:
+            return expected
+    binary_value = manifest.get("binary")
+    if not binary_value:
+        raise InvalidInput("capture source does not match an authorized remote target or manifest binary")
+    binary_relative = Path(binary_value)
+    if binary_relative.is_absolute() or ".." in binary_relative.parts:
+        raise InvalidInput("manifest binary must be a challenge-relative path")
+    challenge = Path(str(session["challenge"])).expanduser().absolute()
+    binary = _read_regular_under(challenge, challenge / binary_relative, "manifest binary")
+    expected = f"local:{binary.path}"
+    if source_target != expected:
+        raise InvalidInput("capture source does not match the authorized target")
+    return expected
 
 
 def main() -> int:
@@ -59,14 +79,17 @@ def main() -> int:
 
     try:
         workspace = args.workspace.expanduser().absolute()
-        session = json.loads((workspace / "session.json").read_text(encoding="utf-8"))
+        session_artifact = _read_regular_under(workspace, workspace / "session.json", "session")
+        manifest_artifact = _read_regular_under(
+            workspace, workspace / "challenge.resolved.yaml", "resolved manifest"
+        )
+        session = json.loads(session_artifact.data.decode("utf-8"))
         if session.get("category") != "pwn":
             raise InvalidInput("capture workspace is not a pwn session")
-        source_target = args.source_target.strip()
-        if not source_target.startswith(("local:", "tcp://")):
-            raise InvalidInput("source target must identify a local process or tcp endpoint")
-        output = contained_regular_file(workspace, args.output, "capture output")
-        sent = contained_regular_file(workspace, args.sent, "sent evidence")
+        manifest = manifest_scalars(manifest_artifact.data)
+        source_target = bound_source_target(workspace, session, manifest, args.source_target)
+        output = _read_regular_under(workspace, args.output, "capture output")
+        sent = _read_regular_under(workspace, args.sent, "sent evidence")
         record = {
             "schema_version": 1,
             "workspace": str(workspace),
@@ -74,8 +97,8 @@ def main() -> int:
             "category": "pwn",
             "capture_id": args.capture_id,
             "source_target": source_target,
-            "output": {"path": str(output), "sha256": digest(output)},
-            "sent": {"path": str(sent), "sha256": digest(sent)},
+            "output": {"path": str(output.path), "sha256": hashlib.sha256(output.data).hexdigest()},
+            "sent": {"path": str(sent.path), "sha256": hashlib.sha256(sent.data).hexdigest()},
         }
         attestation = publish_capture_attestation(workspace, record)
     except (CollisionError, InvalidInput, KeyError, OSError, json.JSONDecodeError) as exc:

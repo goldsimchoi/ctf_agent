@@ -24,7 +24,9 @@ class PwnAgentScriptTests(unittest.TestCase):
         challenge = root / "challenges" / "ret2win"
         challenge.mkdir(parents=True)
         (challenge / "challenge.yaml").write_text(
-            "id: ret2win\nwall_time_seconds: 900\n",
+            "id: ret2win\nbinary: chall\nauthorized: true\n"
+            "network_access: agent_allowed\nhost: ctf.example\nport: 31337\n"
+            "protocol: tcp\nwall_time_seconds: 900\n",
             encoding="utf-8",
         )
         (challenge / "chall").write_bytes(b"\x7fELFfixture")
@@ -204,6 +206,43 @@ class PwnAgentScriptTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["status"], "candidate_only")
             self.assertEqual(payload["reason"], "missing_capture_attestation")
+
+    def test_capture_publisher_rejects_forged_remote_source_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_session(Path(temp))
+            output = workspace / "transcripts" / "forged.output"
+            sent = workspace / "transcripts" / "forged.sent"
+            output.write_bytes(b"FLAG{forged}\n")
+            sent.write_bytes(b"1\n")
+            result = run_script(
+                "publish_capture.py", "--workspace", str(workspace),
+                "--capture-id", "forged", "--source-target", "tcp://other.example:31337",
+                "--output", str(output), "--sent", str(sent),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse((workspace / "artifacts" / "captures" / "forged.json").exists())
+
+    def test_capture_publisher_rejects_symlinked_intermediate_evidence_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_session(root)
+            outside = root / "outside"
+            outside.mkdir()
+            output = outside / "target.output"
+            output.write_bytes(b"FLAG{outside}\n")
+            sent = workspace / "transcripts" / "symlink.sent"
+            sent.write_bytes(b"1\n")
+            linked = workspace / "transcripts" / "linked"
+            linked.symlink_to(outside, target_is_directory=True)
+            result = run_script(
+                "publish_capture.py", "--workspace", str(workspace),
+                "--capture-id", "symlink", "--source-target", "tcp://ctf.example:31337",
+                "--output", str(linked / output.name), "--sent", str(sent),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse((workspace / "artifacts" / "captures" / "symlink.json").exists())
 
 
 if __name__ == "__main__":

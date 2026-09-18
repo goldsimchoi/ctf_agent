@@ -16,6 +16,13 @@ python3 <skill>/scripts/publish_capture.py --workspace <workspace> \
   --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin
 ```
 
+For a remote capture, `source-target` must be the exact manifest-authorized
+`tcp://<host>:<port>` and requires `authorized: true`,
+`network_access: agent_allowed`, and `protocol: tcp` when a protocol is declared.
+For a local capture, use `local:<canonical binary path>` for the regular,
+challenge-contained file named by manifest `binary`. A supplied loader or libc may
+shape local execution but does not replace that authoritative program identity.
+
 Race mode accepts one flag matching the configured/default pattern from an attested
 authorized target output when it is not in sent bytes:
 
