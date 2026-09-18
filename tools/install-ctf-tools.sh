@@ -19,15 +19,32 @@ DRY_RUN=false
 COMPONENT=all
 DEGRADED=()
 
+usage() {
+  printf 'Usage: %s [--dry-run] [--component {sqlmap|radare2}]\n' "$0" >&2
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=true; shift ;;
-    --component) COMPONENT=${2:-}; shift 2 ;;
-    *) echo "Usage: $0 [--dry-run] [--component {sqlmap|radare2}]" >&2; exit 2 ;;
+    --component)
+      if [[ $# -lt 2 ]]; then
+        printf 'error: missing value for --component\n' >&2
+        usage
+        exit 2
+      fi
+      COMPONENT=$2
+      shift 2
+      ;;
+    *)
+      printf 'error: unknown or malformed option: %s\n' "$1" >&2
+      usage
+      exit 2
+      ;;
   esac
 done
 if [[ "$COMPONENT" != all && "$COMPONENT" != sqlmap && "$COMPONENT" != radare2 ]]; then
-  echo "Usage: $0 [--dry-run] [--component {sqlmap|radare2}]" >&2
+  printf 'error: invalid component: %s\n' "$COMPONENT" >&2
+  usage
   exit 2
 fi
 

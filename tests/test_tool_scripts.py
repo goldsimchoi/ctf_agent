@@ -80,6 +80,25 @@ class ToolScriptTests(unittest.TestCase):
         self.assertIn("nuclei", result.stdout)
         self.assertNotIn("@latest", result.stdout)
 
+    def test_installer_rejects_component_without_a_value_before_mutation(self) -> None:
+        """A trailing --component returns usage promptly and never creates its CTF root."""
+        with tempfile.TemporaryDirectory() as temporary:
+            ctf_root = Path(temporary) / "CTF"
+            result = subprocess.run(
+                ["bash", str(INSTALLER), "--component"],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=3,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "CTF_TOOLS_ROOT": str(ctf_root)},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("missing value for --component", result.stderr)
+            self.assertIn("Usage:", result.stderr)
+            self.assertFalse(ctf_root.exists())
+
     def test_checker_emits_one_json_capability_document(self) -> None:
         """The checker must be machine-readable even when capabilities are absent."""
         result = self.run_command("bash", str(CHECKER))
