@@ -9,7 +9,9 @@ Each clue has evidence, summary, xrefs, relevant functions, and a next action.
 Each hypothesis has a falsifying test, status, no-progress count, experiments,
 and linked contradictions. Do not erase evidence that contradicts an appealing
 theory: record it, then reject an active hypothesis after its second no-progress
-experiment.
+experiment. Hypothesis, experiment, and contradiction changes share
+`rev/.state.lock`; a pending `rev/.state.transaction.json` is completed before
+the next change so both ledgers recover together after interruption.
 
 Use only the `authorized: true` challenge-relative `binary` in
 `challenge.resolved.yaml` as the oracle. The solver binds `--binary` to that
@@ -41,3 +43,6 @@ python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
 ```
 
 Do not submit a candidate merely because a decompiler suggests the algorithm.
+Oracle evidence names must be fresh direct children of `rev/oracle/`; the adapter
+holds a no-follow directory descriptor for creation and refuses directory swaps
+before it attests the capture.

@@ -1,7 +1,9 @@
+import fcntl
 import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -299,6 +301,67 @@ class RevAgentTests(unittest.TestCase):
                     self.assertFalse(output.exists())
                     self.assertFalse(ran.exists())
 
+    def test_oracle_directory_replacement_cannot_write_outside_session(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-oracle-dir-swap")
+            init_rev_state(workspace)
+            oracle = workspace / "rev" / "oracle"
+            outside = root / "outside"
+            outside.mkdir()
+            moved = workspace / "rev" / "oracle-moved"
+            target = self.target_path(workspace)
+            target.write_text(
+                "#!/usr/bin/env python3\nfrom pathlib import Path\n"
+                f"Path({str(oracle)!r}).rename({str(moved)!r})\n"
+                f"Path({str(oracle)!r}).symlink_to({str(outside)!r}, target_is_directory=True)\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+            output = oracle / "capture.out"
+
+            result = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace), "--binary", str(target),
+                "--candidate", "input", "--output", str(output),
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse((outside / output.name).exists())
+            self.assertFalse((outside / "capture.sent").exists())
+
+    def test_pending_contradiction_transaction_repairs_one_sided_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-state-recover")
+            state = init_rev_state(workspace)
+            hypothesis = record_hypothesis(workspace, "base", "break at base")
+            hypotheses_path = Path(state["hypotheses"])
+            contradictions_path = Path(state["contradictions"])
+            hypotheses = json.loads(hypotheses_path.read_text())
+            contradictions = json.loads(contradictions_path.read_text())
+            contradiction = {
+                "id": "contradiction-0001", "hypothesis_id": hypothesis["id"],
+                "evidence": "gdb/conflict.txt", "summary": "conflict", "recorded_at": "now",
+            }
+            hypotheses["hypotheses"][0]["contradiction_ids"] = [contradiction["id"]]
+            contradictions["contradictions"] = [contradiction]
+            journal = workspace / "rev" / ".state.transaction.json"
+            journal.write_text(json.dumps({"schema_version": 1, "hypotheses": hypotheses, "contradictions": contradictions}), encoding="utf-8")
+            hypotheses_path.write_text(json.dumps(hypotheses), encoding="utf-8")
+
+            result = run_script(
+                SCRIPTS / "record_clue.py", "experiment", "--workspace", str(workspace),
+                "--hypothesis-id", hypothesis["id"], "--evidence", "gdb/trace.txt",
+                "--result", "reached", "--progress",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(journal.exists())
+            repaired = json.loads(contradictions_path.read_text())["contradictions"]
+            self.assertEqual(repaired, [contradiction])
+            base = json.loads(hypotheses_path.read_text())["hypotheses"][0]
+            self.assertEqual(base["contradiction_ids"], [contradiction["id"]])
+
     def test_oracle_does_not_accept_single_run_strict_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -401,6 +464,48 @@ class RevAgentTests(unittest.TestCase):
             base_row = next(row for row in hypotheses if row["id"] == hypothesis_id)
             self.assertEqual(len(base_row["experiments"]), 1)
             self.assertEqual(base_row["contradiction_ids"], [contradictions[0]["id"]])
+
+    def test_shared_state_lock_blocks_experiment_and_contradiction_until_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-state-lock")
+            base = record_hypothesis(workspace, "base", "break at base")
+            wrapper = root / "ready_exec.py"
+            wrapper.write_text(
+                "import os, sys\nfrom pathlib import Path\n"
+                "Path(sys.argv[1]).write_text('ready')\n"
+                "os.execv(sys.executable, [sys.executable, sys.argv[2], *sys.argv[3:]])\n",
+                encoding="utf-8",
+            )
+            lock_path = workspace / "rev" / ".state.lock"
+            ready_paths = [root / "experiment.ready", root / "contradiction.ready"]
+            commands = [
+                ["experiment", "--workspace", str(workspace), "--hypothesis-id", base["id"],
+                 "--evidence", "gdb/lock.txt", "--result", "reached", "--progress"],
+                ["contradiction", "--workspace", str(workspace), "--hypothesis-id", base["id"],
+                 "--evidence", "gdb/lock-conflict.txt", "--summary", "conflict"],
+            ]
+            with lock_path.open("a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                processes = [
+                    subprocess.Popen(
+                        [sys.executable, str(wrapper), str(ready), str(SCRIPTS / "record_clue.py"), *command],
+                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    )
+                    for ready, command in zip(ready_paths, commands, strict=True)
+                ]
+                deadline = time.monotonic() + 2
+                while not all(path.exists() for path in ready_paths) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(all(path.exists() for path in ready_paths))
+                time.sleep(0.1)
+                self.assertTrue(all(process.poll() is None for process in processes))
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            results = [process.communicate(timeout=3) for process in processes]
+            self.assertTrue(all(process.returncode == 0 for process in processes), results)
+            ledger = json.loads((workspace / "rev" / "hypotheses.json").read_text())["hypotheses"][0]
+            self.assertEqual(len(ledger["experiments"]), 1)
+            self.assertEqual(len(ledger["contradiction_ids"]), 1)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,48 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _transaction_path(paths: dict[str, str]) -> Path:
+    return Path(paths["rev_root"]) / ".state.transaction.json"
+
+
+def _recover_transaction(paths: dict[str, str]) -> None:
+    journal = _transaction_path(paths)
+    if not journal.exists():
+        return
+    try:
+        transaction = json.loads(journal.read_text(encoding="utf-8"))
+        hypotheses = transaction["hypotheses"]
+        contradictions = transaction["contradictions"]
+        if transaction.get("schema_version") != 1 or not isinstance(hypotheses, dict) or not isinstance(contradictions, dict):
+            raise ValueError
+    except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RevStateError(f"invalid pending reversing transaction: {journal}") from exc
+    _atomic_json(Path(paths["hypotheses"]), hypotheses)
+    _atomic_json(Path(paths["contradictions"]), contradictions)
+    _fsync_directory(Path(paths["rev_root"]))
+    journal.unlink()
+    _fsync_directory(Path(paths["rev_root"]))
+
+
+def _commit_transaction(paths: dict[str, str], hypotheses: dict[str, Any], contradictions: dict[str, Any]) -> None:
+    journal = _transaction_path(paths)
+    _atomic_json(journal, {"schema_version": 1, "hypotheses": hypotheses, "contradictions": contradictions})
+    _fsync_directory(Path(paths["rev_root"]))
+    _atomic_json(Path(paths["hypotheses"]), hypotheses)
+    _atomic_json(Path(paths["contradictions"]), contradictions)
+    _fsync_directory(Path(paths["rev_root"]))
+    journal.unlink()
+    _fsync_directory(Path(paths["rev_root"]))
+
+
 def _text(value: str, field: str) -> str:
     normalized = " ".join(value.split())
     if not normalized:
@@ -111,7 +153,9 @@ def record_hypothesis(workspace: Path, statement: str, falsifying_test: str) -> 
     falsifying_test = _text(falsifying_test, "falsifying test")
     path = Path(paths["hypotheses"])
     with _lock(Path(paths["rev_root"]) / ".state.lock"):
+        _recover_transaction(paths)
         payload, entries = _load(path, "hypotheses")
+        contradictions, _ = _load(Path(paths["contradictions"]), "contradictions")
         entry = {
             "id": f"hypothesis-{len(entries) + 1:04d}",
             "statement": statement,
@@ -124,7 +168,7 @@ def record_hypothesis(workspace: Path, statement: str, falsifying_test: str) -> 
         }
         entries.append(entry)
         payload["hypotheses"] = entries
-        _atomic_json(path, payload)
+        _commit_transaction(paths, payload, contradictions)
     return entry
 
 
@@ -142,7 +186,9 @@ def record_experiment(
     result = _text(result, "result")
     path = Path(paths["hypotheses"])
     with _lock(Path(paths["rev_root"]) / ".state.lock"):
+        _recover_transaction(paths)
         payload, entries = _load(path, "hypotheses")
+        contradictions, _ = _load(Path(paths["contradictions"]), "contradictions")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:
             raise RevStateError(f"unknown hypothesis: {hypothesis_id}")
@@ -162,7 +208,7 @@ def record_experiment(
         if no_progress >= 2:
             hypothesis["status"] = "rejected"
             hypothesis["rejection_reason"] = "two no-progress experiments require a new approach"
-        _atomic_json(path, payload)
+        _commit_transaction(paths, payload, contradictions)
     return hypothesis
 
 
@@ -178,6 +224,7 @@ def record_contradiction(
     contradictions_path = Path(paths["contradictions"])
     # A shared lock makes the cross-ledger link consistent for concurrent sessions.
     with _lock(Path(paths["rev_root"]) / ".state.lock"):
+        _recover_transaction(paths)
         hypotheses, entries = _load(hypotheses_path, "hypotheses")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:
@@ -192,8 +239,7 @@ def record_contradiction(
         }
         records.append(record)
         hypothesis.setdefault("contradiction_ids", []).append(record["id"])
-        _atomic_json(contradictions_path, contradictions)
-        _atomic_json(hypotheses_path, hypotheses)
+        _commit_transaction(paths, hypotheses, contradictions)
     return record
 
 

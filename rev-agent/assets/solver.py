@@ -96,28 +96,28 @@ def _stable_binary(path: Path, challenge: Path) -> int:
     return descriptor
 
 
-def _oracle_directory(workspace: Path) -> Path:
+def _oracle_directory(workspace: Path) -> tuple[Path, int]:
     oracle = workspace / "rev" / "oracle"
     oracle.mkdir(parents=True, exist_ok=True)
     metadata = os.lstat(oracle)
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise InvalidInput("oracle directory must be a real session-local directory")
-    return oracle
+    return oracle, os.open(oracle, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 
 
-def _new_evidence_path(path: Path, oracle: Path, description: str) -> Path:
+def _new_evidence_path(path: Path, oracle: Path, directory_fd: int, description: str) -> tuple[Path, str]:
     raw = _absolute(path)
     if not _under(raw, oracle) or raw.parent != oracle:
         raise InvalidInput(f"{description} must be a direct file in this session's rev/oracle directory")
     try:
-        os.lstat(raw)
+        os.stat(raw.name, dir_fd=directory_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return raw
+        return raw, raw.name
     raise InvalidInput(f"{description} already exists or is a symlink: {raw}")
 
 
-def _write_new_bytes(path: Path, data: bytes) -> None:
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+def _write_new_bytes(directory_fd: int, leaf: str, data: bytes) -> None:
+    descriptor = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
     try:
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
@@ -125,8 +125,8 @@ def _write_new_bytes(path: Path, data: bytes) -> None:
             os.fsync(stream.fileno())
     except BaseException:
         try:
-            path.unlink(missing_ok=True)
-        except OSError:
+            os.unlink(leaf, dir_fd=directory_fd)
+        except FileNotFoundError:
             pass
         raise
 
@@ -168,40 +168,38 @@ def run_oracle(
     if timeout <= 0:
         raise InvalidInput("timeout must be positive")
     challenge = _absolute(Path(str(session["challenge"])))
-    oracle = _oracle_directory(workspace)
-    if output is None:
-        output = oracle / f"oracle-{time.time_ns()}.out"
-    output = _new_evidence_path(output, oracle, "oracle output")
-    if sent is None:
-        sent = output.with_suffix(".sent")
-    sent = _new_evidence_path(sent, oracle, "oracle sent input")
-    if output == sent:
-        raise InvalidInput("oracle output and sent input paths must differ")
-    sent_data = candidate.encode("utf-8") + b"\n"
-    descriptor = _stable_binary(binary, challenge)
+    oracle, oracle_fd = _oracle_directory(workspace)
     try:
-        _write_new_bytes(sent, sent_data)
+        if output is None:
+            output = oracle / f"oracle-{time.time_ns()}.out"
+        output, output_leaf = _new_evidence_path(output, oracle, oracle_fd, "oracle output")
+        if sent is None:
+            sent = output.with_suffix(".sent")
+        sent, sent_leaf = _new_evidence_path(sent, oracle, oracle_fd, "oracle sent input")
+        if output == sent:
+            raise InvalidInput("oracle output and sent input paths must differ")
+        sent_data = candidate.encode("utf-8") + b"\n"
+        descriptor = _stable_binary(binary, challenge)
         try:
-            result = subprocess.run(
-                [f"/proc/self/fd/{descriptor}"],
-                input=sent_data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=timeout,
-                check=False,
-                pass_fds=(descriptor,),
-            )
-            transcript = _bytes(result.stdout)
-            returncode = result.returncode
-            timed_out = False
-        except subprocess.TimeoutExpired as exc:
-            transcript = _bytes(exc.output if exc.output is not None else exc.stdout)
-            returncode = None
-            timed_out = True
+            _write_new_bytes(oracle_fd, sent_leaf, sent_data)
+            try:
+                result = subprocess.run(
+                    [f"/proc/self/fd/{descriptor}"], input=sent_data, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, timeout=timeout, check=False, pass_fds=(descriptor,),
+                )
+                transcript, returncode, timed_out = _bytes(result.stdout), result.returncode, False
+            except subprocess.TimeoutExpired as exc:
+                transcript, returncode, timed_out = _bytes(exc.output if exc.output is not None else exc.stdout), None, True
+        finally:
+            os.close(descriptor)
+        _write_new_bytes(oracle_fd, output_leaf, transcript)
+        current = os.stat(oracle)
+        opened = os.fstat(oracle_fd)
+        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+            raise InvalidInput("oracle directory changed during capture")
+        attestation = _attest(workspace, session, binary, output, sent)
     finally:
-        os.close(descriptor)
-    _write_new_bytes(output, transcript)
-    attestation = _attest(workspace, session, binary, output, sent)
+        os.close(oracle_fd)
     return {
         "workspace": str(workspace),
         "binary": str(binary),
