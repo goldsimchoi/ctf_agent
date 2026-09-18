@@ -2,11 +2,13 @@ import json
 import gzip
 import hashlib
 import http.server
+import os
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import zlib
 from contextlib import contextmanager
@@ -22,6 +24,19 @@ COMMON_SCRIPTS = REPO_ROOT / "ctf-common" / "scripts"
 REQUEST = SKILL_DIR / "assets" / "request.py"
 VERIFY_WEB_FLAG = SKILL_DIR / "scripts" / "verify_web_flag.py"
 GZIP_BODY = gzip.compress(b"FLAG{compressed_target_result}", mtime=0)
+READY_EXEC = """
+import os
+import sys
+
+ready = sys.argv[1]
+fd = os.open(ready, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, b"ready")
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.execv(sys.executable, [sys.executable, *sys.argv[2:]])
+"""
 
 
 def run_script(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -31,6 +46,43 @@ def run_script(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         check=False,
     )
+
+
+def start_ready_request(
+    workspace: Path, url: str, ready: Path, *args: str
+) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            READY_EXEC,
+            str(ready),
+            str(REQUEST),
+            "--workspace",
+            str(workspace),
+            "--url",
+            url,
+            *args,
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def wait_for_ready(process: subprocess.Popen[str], ready: Path, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if ready.read_bytes() == b"ready":
+                return
+        except FileNotFoundError:
+            pass
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(f"ready request exited early: {stdout} {stderr}")
+        time.sleep(0.01)
+    raise AssertionError("ready request did not publish its fsynced handshake")
 
 
 class TargetHandler(http.server.BaseHTTPRequestHandler):
@@ -530,17 +582,33 @@ class WebAgentTests(unittest.TestCase):
             workspace = self.make_workspace(Path(temp), "web-concurrent", origin)
             self.init_web_state(workspace)
             with ThreadPoolExecutor(max_workers=2) as pool:
-                first = pool.submit(self.request, workspace, origin + "/first?input=before", "--progress", "new fact: first")
+                first = pool.submit(
+                    self.request, workspace, origin + "/first?input=before", "--progress", "new fact: first"
+                )
                 self.assertTrue(server.first_seen.wait(timeout=5))
-                second = pool.submit(self.request, workspace, origin + "/second", "--progress", "new fact: second")
+                second = start_ready_request(
+                    workspace,
+                    origin + "/second",
+                    Path(temp) / "second-ready",
+                    "--progress",
+                    "new fact: second",
+                )
                 try:
-                    self.assertFalse(server.second_seen.wait(timeout=0.25))
+                    wait_for_ready(second, Path(temp) / "second-ready", timeout=5)
+                    self.assertFalse(server.second_seen.wait(timeout=3))
                     self.assertEqual(server.order, ["first"])
-                    server.release.set()
-                    first_result = first.result(timeout=10)
-                    second_result = second.result(timeout=10)
                 finally:
                     server.release.set()
+                    try:
+                        second_stdout, second_stderr = second.communicate(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        second.kill()
+                        second_stdout, second_stderr = second.communicate(timeout=5)
+
+                first_result = first.result(timeout=10)
+                second_result = subprocess.CompletedProcess(
+                    second.args, second.returncode, second_stdout, second_stderr
+                )
 
             self.assertEqual(first_result.returncode, 0, first_result.stderr)
             self.assertEqual(second_result.returncode, 0, second_result.stderr)
