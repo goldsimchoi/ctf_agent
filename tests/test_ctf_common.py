@@ -1,12 +1,18 @@
+import contextlib
+import importlib.util
+import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = REPO_ROOT / "ctf-common" / "scripts"
 sys.path.insert(0, str(REPO_ROOT / "ctf-common" / "scripts"))
 
 from ctf_workspace import (  # noqa: E402
@@ -18,6 +24,15 @@ from ctf_workspace import (  # noqa: E402
     record_attempt,
     verify_outputs,
 )
+
+
+def run_common_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / name), *args],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 class CommonWorkspaceTests(unittest.TestCase):
@@ -69,7 +84,12 @@ class CommonWorkspaceTests(unittest.TestCase):
         other_finding = publish_finding(second["workspace"], "endpoint", second_evidence, "verified health endpoint")
         payload = json.loads(finding.read_text(encoding="utf-8"))
         self.assertEqual(payload["kind"], "endpoint")
-        self.assertEqual(payload["evidence"], str(evidence.resolve()))
+        shared_evidence = Path(payload["evidence"])
+        self.assertNotEqual(shared_evidence, evidence.resolve())
+        self.assertTrue(shared_evidence.is_file())
+        self.assertEqual(shared_evidence.read_text(encoding="utf-8"), "GET /flag returned 200")
+        evidence.write_text("mutated after publication", encoding="utf-8")
+        self.assertEqual(shared_evidence.read_text(encoding="utf-8"), "GET /flag returned 200")
         self.assertTrue(finding.is_file())
         third = create_session(self.challenge, "web")
         self.assertEqual(third["findings"], sorted([finding, other_finding]))
@@ -94,6 +114,15 @@ class CommonWorkspaceTests(unittest.TestCase):
         with self.assertRaises(InvalidInput):
             record_attempt(progressed["workspace"], " post   /login 401 ")
 
+    def test_progress_label_without_detail_is_rejected(self) -> None:
+        row = create_session(self.challenge, "web")
+
+        with self.assertRaises(InvalidInput):
+            record_attempt(row["workspace"], "GET /admin 403", progress="fact")
+
+        state = record_attempt(row["workspace"], "GET /admin 403")
+        self.assertEqual(state["no_progress"], 1)
+
     def test_race_accepts_one_non_echoed_candidate_but_strict_requires_two(self) -> None:
         output = self.root / "output.txt"
         sent = self.root / "sent.txt"
@@ -116,6 +145,67 @@ class CommonWorkspaceTests(unittest.TestCase):
         result = verify_outputs([output], [sent], (rb"FLAG\{[^}\r\n]+\}",), strict=False)
         self.assertEqual(result["status"], "unverified")
         self.assertEqual(result["reason"], "candidate_was_user_input")
+
+    def test_strict_verification_counts_a_candidate_in_two_of_three_outputs(self) -> None:
+        outputs = [self.root / f"output-{number}.txt" for number in range(3)]
+        outputs[0].write_bytes(b"FLAG{reproduced}\n")
+        outputs[1].write_bytes(b"again FLAG{reproduced}\n")
+        outputs[2].write_bytes(b"later output has no candidate\n")
+
+        result = verify_outputs(outputs, [], (rb"FLAG\{[^}\r\n]+\}",), strict=True)
+
+        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["flag"], "FLAG{reproduced}")
+        self.assertEqual(result["reproductions"], 2)
+
+    def test_cli_parse_errors_are_one_json_object_with_exit_two(self) -> None:
+        cases = (
+            ("init_session.py", str(self.challenge), "--category", "misc"),
+            ("verify_flag.py", "--workspace", str(self.root)),
+        )
+
+        for name, *args in cases:
+            with self.subTest(script=name):
+                result = run_common_script(name, *args)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(len(result.stdout.splitlines()), 1)
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+
+    def test_publish_cli_reports_collision_as_json_error(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "publish_finding_cli", SCRIPTS_DIR / "publish_finding.py"
+        )
+        self.assertIsNotNone(spec)
+        cli = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(cli)
+        output = io.StringIO()
+
+        with (
+            patch.object(cli, "publish_finding", side_effect=CollisionError("finding collision")),
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "publish_finding.py",
+                    "--workspace",
+                    str(self.root),
+                    "--kind",
+                    "endpoint",
+                    "--evidence",
+                    str(self.root / "evidence.txt"),
+                    "--summary",
+                    "collision fixture",
+                ],
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            code = cli.main()
+
+        self.assertEqual(code, 2)
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(json.loads(output.getvalue())["status"], "error")
 
 
 if __name__ == "__main__":

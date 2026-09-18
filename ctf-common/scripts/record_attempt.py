@@ -5,16 +5,16 @@ import argparse
 import json
 from pathlib import Path
 
-from ctf_workspace import BudgetExhausted, InvalidInput, record_attempt
+from ctf_workspace import BudgetExhausted, InvalidInput, JsonArgumentParser, record_attempt
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = JsonArgumentParser()
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--signature", required=True)
     parser.add_argument("--progress")
-    args = parser.parse_args()
     try:
+        args = parser.parse_args()
         state = record_attempt(args.workspace, args.signature, args.progress)
     except BudgetExhausted as exc:
         print(json.dumps({"status": "exhausted", "error": str(exc)}))

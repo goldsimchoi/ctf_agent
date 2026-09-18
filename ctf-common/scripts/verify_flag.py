@@ -5,18 +5,18 @@ import argparse
 import json
 from pathlib import Path
 
-from ctf_workspace import DEFAULT_PATTERNS, InvalidInput, verify_outputs
+from ctf_workspace import DEFAULT_PATTERNS, InvalidInput, JsonArgumentParser, verify_outputs
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = JsonArgumentParser()
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output", type=Path, action="append", required=True)
     parser.add_argument("--sent", type=Path, action="append", default=[])
     parser.add_argument("--pattern", action="append", default=[])
     parser.add_argument("--strict", action="store_true")
-    args = parser.parse_args()
     try:
+        args = parser.parse_args()
         if not args.workspace.expanduser().resolve().is_dir():
             raise InvalidInput(f"workspace is not a directory: {args.workspace}")
         patterns = tuple(item.encode("utf-8") for item in args.pattern) or DEFAULT_PATTERNS

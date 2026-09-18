@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import hashlib
 import json
@@ -32,6 +33,13 @@ class CollisionError(FileExistsError):
 
 class BudgetExhausted(RuntimeError):
     """Raised after state has been saved with an exhausted budget."""
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """Turn invalid command-line input into a caller-owned JSON error."""
+
+    def error(self, message: str) -> None:
+        raise InvalidInput(message)
 
 
 def _utc_now() -> dt.datetime:
@@ -163,6 +171,24 @@ def _write_new_json(path: Path, payload: dict[str, Any]) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(payload, stream, indent=2, sort_keys=True, ensure_ascii=False)
             stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary, path)
+    except FileExistsError:
+        raise
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _write_new_bytes(path: Path, content: bytes) -> None:
+    """Atomically publish immutable binary evidence without replacement."""
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         os.link(temporary, path)
@@ -312,20 +338,28 @@ def publish_finding(workspace: Path, kind: str, evidence: Path, summary: str) ->
     session = _json_path(workspace / "session.json")
     destination = common_root / "shared" / "findings" / str(session["session_id"])
     destination.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "created_at": _utc_now().isoformat(),
-        "evidence": str(evidence),
-        "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest(),
-        "kind": kind,
-        "session_id": session["session_id"],
-        "summary": summary.strip(),
-    }
+    content = evidence.read_bytes()
     for _ in range(16):
-        path = destination / f"{_timestamp()}-{secrets.token_hex(4)}.json"
+        stem = f"{_timestamp()}-{secrets.token_hex(4)}"
+        evidence_path = destination / f"{stem}-{safe_slug(evidence.name)}"
+        try:
+            _write_new_bytes(evidence_path, content)
+        except FileExistsError:
+            continue
+        payload = {
+            "created_at": _utc_now().isoformat(),
+            "evidence": str(evidence_path),
+            "evidence_sha256": hashlib.sha256(content).hexdigest(),
+            "kind": kind,
+            "session_id": session["session_id"],
+            "summary": summary.strip(),
+        }
+        path = destination / f"{stem}.json"
         try:
             _write_new_json(path, payload)
             return path
         except FileExistsError:
+            evidence_path.unlink(missing_ok=True)
             continue
     raise CollisionError("could not publish unique finding")
 
@@ -351,14 +385,17 @@ def _normal_signature(signature: str) -> str:
 
 
 def _new_fact(progress: str | None) -> bool:
-    return bool(
-        progress
-        and re.search(
-            r"\b(?:new\s+)?(?:fact|primitive|endpoint|clue|flag(?:\s+candidate)?)\b",
-            progress,
-            re.IGNORECASE,
+    if progress is None:
+        return False
+    if not re.fullmatch(
+        r"\s*(?:new\s+)?(?:fact|primitive|endpoint|clue|flag(?:\s+candidate)?)\b(?:\s*[:=-]\s*|\s+)\S(?:.*\S)?\s*",
+        progress,
+        re.IGNORECASE,
+    ):
+        raise InvalidInput(
+            "progress requires a fact, primitive, endpoint, clue, or flag candidate with detail"
         )
-    )
+    return True
 
 
 def record_attempt(workspace: Path, signature: str, progress: str | None = None) -> dict[str, Any]:
@@ -407,7 +444,7 @@ def verify_outputs(
         raise InvalidInput(str(exc)) from exc
     if strict and len(outputs) < 2:
         return {"status": "unverified", "reason": "requires_two_clean_reproductions", "flag": None, "reproductions": 0}
-    candidates = set.intersection(*per_output) if strict else set().union(*per_output)
+    candidates = set().union(*per_output)
     if not candidates:
         return {
             "status": "unverified",
@@ -415,12 +452,20 @@ def verify_outputs(
             "flag": None,
             "reproductions": 0,
         }
-    independent = sorted((item for item in candidates if item not in sent_data), key=lambda item: (len(item), item))
+    reproductions = {item: sum(item in found for found in per_output) for item in candidates}
+    independent = sorted(
+        (
+            item
+            for item in candidates
+            if item not in sent_data and (not strict or reproductions[item] >= 2)
+        ),
+        key=lambda item: (len(item), item),
+    )
     if not independent:
         return {"status": "unverified", "reason": "candidate_was_user_input", "flag": None, "reproductions": 0}
     return {
         "status": "verified",
         "reason": "reproduced_in_clean_sessions" if strict else "attributable_target_result",
         "flag": independent[0].decode("utf-8", errors="replace"),
-        "reproductions": len(outputs) if strict else 1,
+        "reproductions": reproductions[independent[0]],
     }
