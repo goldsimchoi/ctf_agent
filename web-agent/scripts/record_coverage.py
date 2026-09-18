@@ -86,7 +86,7 @@ def _under(path: Path, root: Path) -> bool:
 def _evidence_path(evidence: Path | None, workspace: Path) -> str:
     if evidence is None:
         raise WebStateError("confirmed coverage requires an evidence path")
-    return str(validate_response_provenance(workspace, evidence)["response"])
+    return str(validate_response_provenance(workspace, evidence)["response_entity_body"])
 
 
 def record_coverage(

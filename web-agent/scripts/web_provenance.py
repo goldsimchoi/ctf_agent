@@ -83,15 +83,15 @@ def validate_response_provenance(workspace: Path, evidence: Path) -> dict:
     responses = workspace / "web" / "responses"
     requests = workspace / "web" / "requests"
     evidence = evidence.expanduser().resolve()
-    if not evidence.is_file() or evidence.parent != responses.resolve() or evidence.suffix != ".raw":
-        raise WebStateError("evidence must be a recorded raw response in this web session")
+    if not evidence.is_file() or evidence.parent != responses.resolve() or evidence.suffix != ".body":
+        raise WebStateError("evidence must be a recorded response entity body in this web session")
     matches: list[dict] = []
     for path in (workspace / "web" / "provenance").glob("*.json"):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
-        if isinstance(payload, dict) and payload.get("response") == str(evidence):
+        if isinstance(payload, dict) and payload.get("response_entity_body") == str(evidence):
             matches.append(payload)
     if len(matches) != 1:
         raise WebStateError("response has no unique recorded web provenance")
@@ -103,7 +103,7 @@ def validate_response_provenance(workspace: Path, evidence: Path) -> dict:
         or record.get("authorized_origin") != origin
         or not request.is_file()
         or request.parent != requests.resolve()
-        or record.get("response_sha256") != _digest(evidence)
+        or record.get("entity_body_sha256") != _digest(evidence)
         or record.get("request_sha256") != _digest(request)
         or _url_origin(str(record.get("request_url", ""))) != origin
     ):

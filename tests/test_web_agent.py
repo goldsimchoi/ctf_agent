@@ -9,6 +9,7 @@ import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 import yaml
 
@@ -57,6 +58,28 @@ class CountHandler(http.server.BaseHTTPRequestHandler):
         self.server.hits += 1
         self.send_response(200)
         self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class EchoHandler(http.server.BaseHTTPRequestHandler):
+    def _reply(self, encoded: str) -> None:
+        values = [value for _, value in parse_qsl(encoded, keep_blank_values=True)]
+        body = next((value for value in values if value.startswith("FLAG{")), "no flag").encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        self._reply(urlsplit(self.path).query)
+
+    def do_POST(self) -> None:
+        self.server.hits += 1
+        length = int(self.headers.get("Content-Length", "0"))
+        self._reply(self.rfile.read(length).decode("ascii"))
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -200,7 +223,7 @@ class WebAgentTests(unittest.TestCase):
             )
             tested = self.record_coverage(workspace, *base, "--status", "tested")
             promising = self.record_coverage(workspace, *base, "--status", "promising")
-            fake_evidence = workspace / "web" / "responses" / "account.raw"
+            fake_evidence = workspace / "web" / "responses" / "account.body"
             fake_evidence.write_bytes(b"not recorded target evidence")
             confirmed = self.record_coverage(
                 workspace, *base, "--status", "confirmed", "--evidence", str(fake_evidence)
@@ -238,14 +261,17 @@ class WebAgentTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             output = json.loads(result.stdout)
-            response = Path(output["response"])
+            response = Path(output["response_entity_body"])
             provenance = json.loads(Path(output["provenance"]).read_text(encoding="utf-8"))
+            self.assertEqual(response.suffix, ".body")
             self.assertEqual(response.read_bytes(), GZIP_BODY)
-            self.assertEqual(provenance["response_sha256"], hashlib.sha256(GZIP_BODY).hexdigest())
+            self.assertEqual(provenance["entity_body_sha256"], hashlib.sha256(GZIP_BODY).hexdigest())
             self.assertEqual(provenance["status"], 200)
             self.assertIn(["X-Target-Evidence", "present"], provenance["headers"])
             self.assertFalse(provenance["request_capture"]["wire_exact"])
+            self.assertFalse(provenance["body_capture"]["wire_exact"])
             self.assertEqual(provenance["body_capture"]["content_encoding"], "gzip")
+            self.assertIn("HTTP framing", provenance["body_capture"]["transport_limitations"])
 
     def test_request_rejects_target_origin_and_non_web_session_before_traffic(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
@@ -292,15 +318,15 @@ class WebAgentTests(unittest.TestCase):
             arbitrary = workspace / "artifacts" / "shell-output.raw"
             arbitrary.write_bytes(b"FLAG{shell_output}")
             rejected = self.verify(workspace, "--output", str(arbitrary))
-            race = self.verify(workspace, "--output", first["response"])
+            race = self.verify(workspace, "--output", first["response_entity_body"])
             duplicate_strict = self.verify(
-                workspace, "--output", first["response"], "--output", first["response"], "--strict"
+                workspace, "--output", first["response_entity_body"], "--output", first["response_entity_body"], "--strict"
             )
             second = json.loads(self.request(
                 workspace, origin + "/gzip", "--progress", "new fact: second target result"
             ).stdout)
             strict = self.verify(
-                workspace, "--output", first["response"], "--output", second["response"], "--strict"
+                workspace, "--output", first["response_entity_body"], "--output", second["response_entity_body"], "--strict"
             )
 
             self.assertEqual(rejected.returncode, 2)
@@ -316,9 +342,30 @@ class WebAgentTests(unittest.TestCase):
             self.assertEqual(self.record_coverage(workspace, *base, "--status", "tested").returncode, 0)
             self.assertEqual(self.record_coverage(workspace, *base, "--status", "promising").returncode, 0)
             self.assertEqual(
-                self.record_coverage(workspace, *base, "--status", "confirmed", "--evidence", first["response"]).returncode,
+                self.record_coverage(workspace, *base, "--status", "confirmed", "--evidence", first["response_entity_body"]).returncode,
                 0,
             )
+
+    def test_web_verifier_rejects_percent_decoded_url_and_form_echoes(self) -> None:
+        with local_server(EchoHandler) as (_, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-echo", origin)
+            self.init_web_state(workspace)
+            from_url = json.loads(self.request(
+                workspace,
+                origin + "/echo?one=FLAG%7Bvalue%7D&one=second+value",
+                "--progress", "new fact: encoded URL echo",
+            ).stdout)
+            from_form = json.loads(self.request(
+                workspace,
+                origin + "/echo",
+                "--method", "POST",
+                "--header", "Content-Type=application/x-www-form-urlencoded",
+                "--data", "one=FLAG%7Bvalue%7D&one=second+value",
+                "--progress", "new fact: encoded form echo",
+            ).stdout)
+
+            self.assertEqual(self.verify(workspace, "--output", from_url["response_entity_body"]).returncode, 2)
+            self.assertEqual(self.verify(workspace, "--output", from_form["response_entity_body"]).returncode, 2)
 
 
 if __name__ == "__main__":

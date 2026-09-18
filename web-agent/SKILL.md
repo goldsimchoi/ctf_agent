@@ -37,9 +37,9 @@ full tuple `endpoint × method × input location × parameter × technique` in
 include query, form, JSON, headers, cookies, path components, browser storage,
 and WebSocket/message payloads.
 
-- Save complete request and response bytes; summaries retain status, redirects,
-  length, timing, cookie changes, and parsing/tool errors. Do not confuse a
-  rendered page or shell output with target evidence.
+- Save prepared-request evidence and undecoded response entity-body bytes;
+  provenance retains parsed status/headers, redirects, length, timing, cookie
+  changes, and parsing/tool errors. These are not literal HTTP wire captures.
 - Record normalized requests through the common attempt ledger before sending;
   unchanged failures are rejected. After two no-progress attempts, change the
   hypothesis/strategy rather than repeat it.
@@ -47,12 +47,13 @@ and WebSocket/message payloads.
   injection, or execution) in `web/capabilities.json`, separate from the flag
   objective. Once a capability exists, choose the shortest evidence-backed path
   to the flag.
-- Only advance `promising` to `confirmed` with a raw target response under this
-  session's `web/responses/`. `confirmed` and `discarded` are terminal.
+- Only advance `promising` to `confirmed` with a provenance-verified target
+  response entity body under this session's `web/responses/`. `confirmed` and
+  `discarded` are terminal.
 
 Use [assets/request.py](assets/request.py) for ordinary HTTP probes; it uses a
-session-owned `requests.Session`, explicit timeout, an exact-origin check, raw
-evidence files, and the normalized attempt guard. Use the same constraints for
+session-owned `requests.Session`, explicit timeout, an exact-origin check,
+prepared/entity-body evidence, and the normalized attempt guard. Use the same constraints for
 Playwright or WebSocket work, passing this session's browser profile.
 
 ## Finish
@@ -64,10 +65,10 @@ delegates candidate checking:
 
 ```text
 python3 <skill>/scripts/verify_web_flag.py --workspace <workspace> \
-  --output web/responses/<response>.raw
+  --output web/responses/<response>.body
 ```
 
 For `mode: strict`, submit two clean target response files and add `--strict`.
 Read [references/state-and-verification.md](references/state-and-verification.md).
 Stop polishing once verification succeeds; then write a short `WRITEUP.md` or
-report the terminal blocker with workspace and raw evidence paths.
+report the terminal blocker with workspace and entity-body evidence paths.

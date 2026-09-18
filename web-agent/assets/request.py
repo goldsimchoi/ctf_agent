@@ -95,7 +95,7 @@ def capture_hop(workspace: Path, request_id: str, hop: int, response: requests.R
     prepared = response.request
     prepared_body = _body(prepared.body)
     request_file = web / "requests" / f"{request_id}-{hop}.prepared.json"
-    response_file = web / "responses" / f"{request_id}-{hop}.raw"
+    response_file = web / "responses" / f"{request_id}-{hop}.body"
     provenance_file = web / "provenance" / f"{request_id}-{hop}.json"
     entity_body = response.raw.read(decode_content=False)
     atomic_json(request_file, {
@@ -108,10 +108,11 @@ def capture_hop(workspace: Path, request_id: str, hop: int, response: requests.R
         "schema_version": 1, "kind": "web-http-response-v1", "request_id": request_id, "hop": hop,
         "authorized": True, "authorized_origin": origin, "request_url": prepared.url,
         "request": str(request_file), "request_sha256": hashlib.sha256(request_file.read_bytes()).hexdigest(),
-        "response": str(response_file), "response_sha256": hashlib.sha256(entity_body).hexdigest(),
+        "response_entity_body": str(response_file), "entity_body_sha256": hashlib.sha256(entity_body).hexdigest(),
         "status": response.status_code, "reason": response.reason, "headers": _headers(response),
         "body_capture": {
-            "kind": "urllib3_raw_entity_body", "content_encoding": response.headers.get("Content-Encoding"),
+            "kind": "urllib3_undecoded_entity_body", "wire_exact": False,
+            "content_encoding": response.headers.get("Content-Encoding"),
             "content_encoding_decoded": False,
             "transport_limitations": "HTTP framing and original header wire serialization are unavailable through requests.",
         },
@@ -172,7 +173,7 @@ def main() -> int:
         summary_file = web / "responses" / f"{request_id}.summary.json"
         atomic_json(summary_file, {
             "request_id": request_id, "requests": [str(item[0]) for item in captures],
-            "responses": [str(item[1]) for item in captures], "provenance": [str(item[2]) for item in captures],
+            "response_entity_bodies": [str(item[1]) for item in captures], "provenance": [str(item[2]) for item in captures],
             "status": final.status_code, "length": final_response.stat().st_size, "elapsed_ms": elapsed_ms,
             "redirects": [{"url": item[3].url, "status": item[3].status_code} for item in captures[:-1]],
             "set_cookie": final.headers.get("Set-Cookie"),
@@ -180,7 +181,7 @@ def main() -> int:
         save_session(session, web / "cookies.json")
         for _, _, _, response in captures:
             response.close()
-        print(json.dumps({"request": str(final_request), "response": str(final_response), "provenance": str(final_provenance), "summary": str(summary_file)}))
+        print(json.dumps({"prepared_request": str(final_request), "response_entity_body": str(final_response), "provenance": str(final_provenance), "summary": str(summary_file)}))
         return 0
     except (OSError, ValueError, WebStateError, json.JSONDecodeError, requests.RequestException) as exc:
         error_file = args.workspace.expanduser().resolve() / "web" / "responses" / f"{time.time_ns()}.error.json"
