@@ -2,15 +2,28 @@
 
 The Lead Solver owns the canonical exploit and final decision.
 
-1. Initialize the supplied challenge directory and read returned immutable findings
-   before triage.
-2. Triage file type, architecture, mitigations, imports, strings, protocol,
+1. Identify one dedicated challenge directory and retain the complete pasted event
+   statement. Extract TCP candidates only from supplied context in `nc host port`,
+   `host:port`, or `tcp://host:port` form; never connect to candidates to choose one.
+   Missing TCP context means local-only. Ask one precise question when multiple
+   plausible tuples remain.
+2. Inspect supplied files read-only by type/magic and select one clear
+   challenge-relative ELF, PE, or script as `binary`. Ask one precise question when
+   multiple executable candidates remain; do not run them to decide.
+3. Initialize by passing the exact statement and selected `target`, `binary`, and
+   optional `flag_pattern` as one JSON object over stdin to
+   `init_run.py --request-json -`. Free-form prose must never appear in shell argv.
+   No YAML or labeled fields are required, and challenge inputs remain unchanged. For every
+   challenge below `/home/normalone/CTF`, pass
+   `--event-root /home/normalone/CTF`; otherwise pass its containing event root.
+   Read returned immutable findings before solve triage.
+4. Triage file type, architecture, mitigations, imports, strings, protocol,
    supplied libc/loader, and one normal execution.
-3. Create a small runnable `exploit.py`; make each unknown a hypothesis with one
+5. Create a small runnable `exploit.py`; make each unknown a hypothesis with one
    discriminating experiment.
-4. Use static inspection → controlled local run → GDB → primitive → local chain →
+6. Use static inspection → controlled local run → GDB → primitive → local chain →
    manifest-scoped remote reproduction.
-5. Record every meaningful target interaction:
+7. Record every meaningful target interaction:
 
    ```text
    python3 <common>/record_attempt.py --workspace <workspace> --signature '<attempt>'
@@ -18,7 +31,7 @@ The Lead Solver owns the canonical exploit and final decision.
 
    Add `--progress 'new fact: <detail>'` only for new evidence. The common helper
    rejects unchanged failures and ends the no-progress budget after two attempts.
-6. Keep compact evidence references in `notes.md`; save raw I/O and debugger output
+8. Keep compact evidence references in `notes.md`; save raw I/O and debugger output
    under session artifacts. Publish a verified reusable fact with:
 
    ```text
@@ -26,7 +39,7 @@ The Lead Solver owns the canonical exploit and final decision.
      --evidence artifacts/<file> --summary '<verified fact>'
    ```
 
-7. After each target interaction, keep exact sent and received files in the session
+9. After each target interaction, keep exact sent and received files in the session
    and publish its immutable attestation before verification:
 
    ```text

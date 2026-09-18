@@ -10,6 +10,9 @@ from pathlib import Path
 
 
 COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "ctf-common" / "scripts"
+sys.path.insert(0, str(COMMON_SCRIPTS))
+
+from ctf_intake import MAX_REQUEST_BYTES  # noqa: E402
 
 
 def main() -> int:
@@ -20,7 +23,22 @@ def main() -> int:
     # Legacy names map without changing their meaning when the old root is runs/.
     parser.add_argument("--runs-root", type=Path)
     parser.add_argument("--run-id")
+    parser.add_argument("--request-json", metavar="{-|PATH}")
+    parser.add_argument("--statement")
+    parser.add_argument("--target")
+    parser.add_argument("--binary")
+    parser.add_argument("--flag-pattern")
     args = parser.parse_args()
+
+    individual = (args.statement, args.target, args.binary, args.flag_pattern)
+    if args.request_json is not None and any(value is not None for value in individual):
+        parser.error("--request-json cannot be mixed with individual intake flags")
+
+    request_input: bytes | None = None
+    if args.request_json == "-":
+        request_input = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+        if len(request_input) > MAX_REQUEST_BYTES:
+            parser.error(f"request JSON stdin exceeds {MAX_REQUEST_BYTES} bytes")
 
     event_root = args.event_root
     if args.runs_root is not None:
@@ -48,7 +66,17 @@ def main() -> int:
         command.extend(("--event-root", str(event_root)))
     if session_id is not None:
         command.extend(("--session-id", session_id))
-    return subprocess.run(command, check=False).returncode
+    if args.request_json is not None:
+        command.extend(("--request-json", args.request_json))
+    for option, value in (
+        ("--statement", args.statement),
+        ("--target", args.target),
+        ("--binary", args.binary),
+        ("--flag-pattern", args.flag_pattern),
+    ):
+        if value is not None:
+            command.extend((option, value))
+    return subprocess.run(command, check=False, input=request_input).returncode
 
 
 if __name__ == "__main__":

@@ -10,12 +10,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "pwn-agent"
 
 
-def run_script(name: str, *args: str) -> subprocess.CompletedProcess[str]:
+def run_script(
+    name: str,
+    *args: str,
+    input: str | None = None,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(SKILL_DIR / "scripts" / name), *args],
         text=True,
         capture_output=True,
         check=False,
+        input=input,
     )
 
 
@@ -107,6 +112,191 @@ class PwnAgentScriptTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["session_id"], "legacy-pwn-run")
             self.assertEqual(Path(payload["workspace"]).parents[2], event_root / "runs" / "pwn")
+
+    def test_init_run_accepts_lossless_stdin_intake_and_binds_capture_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            event_root = Path(temp) / "event"
+            challenge = event_root / "challenges" / "stdin-pwn"
+            challenge.mkdir(parents=True)
+            binary = challenge / "chall"
+            binary.write_bytes(b"\x7fELFfixture")
+            other_binary = challenge / "other"
+            other_binary.write_bytes(b"\x7fELFother")
+            statement = (
+                "The service is available with nc pwn.example 31337\n"
+                "Preserve `quotes`, $(commands), and {{ templates }} exactly."
+            )
+            payload = json.dumps(
+                {
+                    "statement": statement,
+                    "target": "nc pwn.example 31337",
+                    "binary": "chall",
+                }
+            )
+
+            result = run_script(
+                "init_run.py",
+                str(challenge),
+                "--event-root",
+                str(event_root),
+                "--request-json",
+                "-",
+                input=payload,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(len(result.stdout.splitlines()), 1)
+            row = json.loads(result.stdout)
+            workspace = Path(row["workspace"])
+            stored = json.loads(
+                Path(row["intake"]["request_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(stored["statement"], statement)
+            self.assertEqual(
+                (stored["normalized"]["host"], stored["normalized"]["port"]),
+                ("pwn.example", 31337),
+            )
+            self.assertFalse((challenge / "challenge.yaml").exists())
+            manifest = (workspace / "challenge.resolved.yaml").read_text(
+                encoding="utf-8"
+            )
+            for scalar in (
+                'authorized: "true"',
+                "binary: chall",
+                "host: pwn.example",
+                "network_access: agent_allowed",
+                'port: "31337"',
+                "protocol: tcp",
+            ):
+                self.assertIn(scalar, manifest)
+
+            output = workspace / "transcripts" / "intake.output"
+            sent = workspace / "transcripts" / "intake.sent"
+            output.write_bytes(b"target response\n")
+            sent.write_bytes(b"1\n")
+            accepted_targets = (
+                "tcp://pwn.example:31337",
+                f"local:{binary.resolve()}",
+            )
+            for index, source_target in enumerate(accepted_targets):
+                accepted = run_script(
+                    "publish_capture.py",
+                    "--workspace",
+                    str(workspace),
+                    "--capture-id",
+                    f"accepted-{index}",
+                    "--source-target",
+                    source_target,
+                    "--output",
+                    str(output),
+                    "--sent",
+                    str(sent),
+                )
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+            rejected_targets = (
+                "tcp://other.example:31337",
+                f"local:{other_binary.resolve()}",
+            )
+            for index, source_target in enumerate(rejected_targets):
+                rejected = run_script(
+                    "publish_capture.py",
+                    "--workspace",
+                    str(workspace),
+                    "--capture-id",
+                    f"rejected-{index}",
+                    "--source-target",
+                    source_target,
+                    "--output",
+                    str(output),
+                    "--sent",
+                    str(sent),
+                )
+                self.assertEqual(rejected.returncode, 2)
+
+    def test_init_run_forwards_individual_intake_fields_as_literal_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            challenge = root / "individual-pwn"
+            challenge.mkdir()
+            (challenge / "chall with spaces").write_bytes(b"\x7fELFfixture")
+            statement = "Literal $(not-a-command) and `not-code`"
+
+            result = run_script(
+                "init_run.py",
+                str(challenge),
+                "--statement",
+                statement,
+                "--target",
+                "pwn.example:31337",
+                "--binary",
+                "chall with spaces",
+                "--flag-pattern",
+                r"PWN\{[^}]+\}",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            row = json.loads(result.stdout)
+            stored = json.loads(
+                Path(row["intake"]["request_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(stored["statement"], statement)
+            self.assertEqual(stored["target_input"], "pwn.example:31337")
+            self.assertEqual(stored["binary"], "chall with spaces")
+            self.assertEqual(stored["flag_pattern"], r"PWN\{[^}]+\}")
+
+    def test_init_run_rejects_missing_or_malformed_stdin_before_allocation(self) -> None:
+        invalid_inputs = (None, "{not-json")
+        for index, invalid_input in enumerate(invalid_inputs):
+            with self.subTest(index=index):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    challenge = root / "invalid-pwn"
+                    challenge.mkdir()
+
+                    result = run_script(
+                        "init_run.py",
+                        str(challenge),
+                        "--request-json",
+                        "-",
+                        input=invalid_input,
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stderr, "")
+                    self.assertEqual(json.loads(result.stdout)["status"], "error")
+                    self.assertFalse((root / "runs").exists())
+
+    def test_init_run_rejects_mixed_or_oversized_stdin_before_starting_child(self) -> None:
+        cases = (
+            (json.dumps({"statement": "valid"}), ("--statement", "mixed")),
+            ("x" * (1024 * 1024), ()),
+        )
+        for index, (stdin, extra) in enumerate(cases):
+            with self.subTest(index=index):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    challenge = root / "rejected-pwn"
+                    challenge.mkdir()
+
+                    result = run_script(
+                        "init_run.py",
+                        str(challenge),
+                        "--request-json",
+                        "-",
+                        *extra,
+                        input=stdin,
+                    )
+
+                    self.assertEqual(result.returncode, 2)
+                    expected_error = (
+                        "cannot be mixed"
+                        if extra
+                        else "request JSON stdin exceeds"
+                    )
+                    self.assertIn(expected_error, result.stderr)
+                    self.assertFalse((root / "runs").exists())
 
     def test_race_verifies_one_attested_non_echoed_capture_and_writes_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

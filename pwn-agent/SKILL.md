@@ -11,21 +11,51 @@ not a flag result.
 
 ## Start
 
-1. Accept only user-supplied local artifacts and manifest-scoped endpoints. Missing
-   `network_access` means `user_only`; connect only when `authorized: true` and
-   `network_access: agent_allowed`. Never scan for targets.
-2. Read [references/safety.md](references/safety.md), then initialize a challenge
-   directory before analysis writes:
+1. Identify the one dedicated problem folder from the request. It may have no
+   `challenge.yaml`; no YAML, labels such as `description:` or `address:`, or fixed
+   problem-statement layout is required. Never treat `/home/normalone/CTF` itself
+   or a folder containing multiple problems as the challenge directory.
+2. Preserve the entire pasted event statement exactly. Interpret its natural-language
+   meaning and recognize TCP candidates written as `nc host port`, `host:port`, or
+   `tcp://host:port`. Select exactly one clear candidate without connecting to any
+   candidate; if multiple plausible host/port tuples remain, ask one precise question.
+   No address means local-only analysis.
+3. Read [references/safety.md](references/safety.md), then inspect supplied files
+   read-only by type/magic to identify one clear challenge-relative ELF, PE, or script
+   candidate. Do not execute a candidate during selection. If multiple local
+   executables are equally plausible, ask one precise question instead of guessing.
+4. Send one normalized JSON object as standard input, never as shell arguments, to:
 
    ```text
-   python3 <skill>/scripts/init_run.py <challenge-dir> --event-root <event-root>
+   python3 <skill>/scripts/init_run.py <challenge-dir> \
+     --event-root <event-root> --request-json -
    ```
 
-   The JSON result identifies an isolated `runs/pwn/` session and existing immutable
-   findings. Keep challenge inputs read-only. If needed, put the minimal manifest
-   from [assets/challenge.yaml](assets/challenge.yaml) in the challenge directory.
-3. Read shared findings before triage. Reuse only evidence-backed facts for this
-   fingerprint, never old hypotheses. Work only in the returned session.
+   Use `/home/normalone/CTF` as `<event-root>` whenever the challenge is below that
+   root. Otherwise use the containing event root. The stdin object has `statement`
+   set to the exact full prose and includes `target`, `binary`, and `flag_pattern`
+   only when selected. For example, its data shape is:
+
+   ```json
+   {
+     "statement": "<entire exact pasted event statement>",
+     "target": "tcp://pwn.example:31337",
+     "binary": "chall"
+   }
+   ```
+
+   Pass those JSON bytes through stdin using a process API; never interpolate,
+   quote, or otherwise place free-form statement prose in a shell command. The
+   initializer validates the selections and produces the session-local resolved
+   manifest. Do not add YAML to the challenge directory.
+5. The one-line JSON result identifies an isolated `runs/pwn/` session and existing
+   immutable findings. Read those findings before solve triage, reuse only
+   evidence-backed facts for this fingerprint, and work only in the returned session.
+
+Accept only user-supplied local artifacts and the endpoint bound by the resolved
+manifest. Direct connection requires `authorized: true` and
+`network_access: agent_allowed`; missing `network_access` means `user_only`. Never
+scan for targets.
 
 ## Solve
 
