@@ -21,6 +21,7 @@ from ctf_workspace import (  # noqa: E402
     CollisionError,
     InvalidInput,
     create_session,
+    publish_capture_attestation,
     publish_finding,
     record_attempt,
     verify_outputs,
@@ -64,7 +65,7 @@ class CommonWorkspaceTests(unittest.TestCase):
         sent = workspace / "transcripts" / f"{capture_id}.sent"
         output.write_bytes(output_data)
         sent.write_bytes(sent_data)
-        return output, sent, {
+        attestation = {
             "schema_version": 1,
             "workspace": str(workspace.resolve()),
             "session_id": row["session_id"],
@@ -80,6 +81,7 @@ class CommonWorkspaceTests(unittest.TestCase):
                 "sha256": hashlib.sha256(sent_data).hexdigest(),
             },
         }
+        return output, sent, publish_capture_attestation(workspace, attestation)
 
     def test_challenges_and_categories_receive_isolated_workspaces(self) -> None:
         web = create_session(self.challenge, "web")
@@ -287,6 +289,82 @@ class CommonWorkspaceTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "candidate_only")
         self.assertEqual(result["reason"], "duplicate_capture_attestation")
+
+    def test_strict_verification_rejects_hardlinked_output_alias(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, first = self.make_capture(row, "capture-one", b"FLAG{aliased}\n")
+        alias = row["workspace"] / "transcripts" / "capture-two.output"
+        alias.hardlink_to(output)
+        second_record = {
+            "schema_version": 1,
+            "workspace": str(row["workspace"]),
+            "session_id": row["session_id"],
+            "category": row["category"],
+            "capture_id": "capture-two",
+            "source_target": "https://ctf.example/challenge",
+            "output": {"path": str(alias), "sha256": hashlib.sha256(b"FLAG{aliased}\n").hexdigest()},
+            "sent": {"path": str(sent), "sha256": hashlib.sha256(b"menu choice 1\n").hexdigest()},
+        }
+        second = publish_capture_attestation(row["workspace"], second_record)
+
+        result = verify_outputs(
+            [output, alias], [sent], (rb"FLAG\{[^}\r\n]+\}",), strict=True,
+            workspace=row["workspace"], attestations=[first, second],
+        )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "duplicate_capture_attestation")
+
+    def test_verifier_rejects_symlinked_capture_record_without_path_read(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, _ = self.make_capture(row, "capture-one", b"FLAG{symlinked}\n")
+        outside = Path(self.temp.name) / "outside-attestation.json"
+        outside.write_text("{}", encoding="utf-8")
+        capture = row["workspace"] / "artifacts" / "captures" / "symlink.json"
+        capture.symlink_to(outside)
+
+        result = verify_outputs(
+            [output], [sent], (rb"FLAG\{[^}\r\n]+\}",), strict=False,
+            workspace=row["workspace"], attestations=[capture],
+        )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "invalid_capture_attestation")
+
+    def test_verifier_treats_malformed_capture_record_as_candidate_only(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, _ = self.make_capture(row, "capture-one", b"FLAG{malformed}\n")
+        malformed = row["workspace"] / "artifacts" / "captures" / "malformed.json"
+        malformed.write_text("not json", encoding="utf-8")
+
+        result = verify_outputs(
+            [output], [sent], (rb"FLAG\{[^}\r\n]+\}",), strict=False,
+            workspace=row["workspace"], attestations=[malformed],
+        )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "invalid_capture_attestation")
+
+    def test_verify_cli_treats_malformed_capture_record_as_candidate_only(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, _ = self.make_capture(row, "capture-one", b"FLAG{cli_malformed}\n")
+        malformed = row["workspace"] / "artifacts" / "captures" / "malformed.json"
+        malformed.write_text("not json", encoding="utf-8")
+
+        result = run_common_script(
+            "verify_flag.py",
+            "--workspace", str(row["workspace"]),
+            "--output", str(output),
+            "--sent", str(sent),
+            "--attestation", str(malformed),
+            "--pattern", r"FLAG\{[^}\r\n]+\}",
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "candidate_only")
+        self.assertEqual(payload["reason"], "invalid_capture_attestation")
 
     def test_initializer_skips_tampered_shared_finding_evidence(self) -> None:
         row = create_session(self.challenge, "web")

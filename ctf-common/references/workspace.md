@@ -47,9 +47,21 @@ schema is:
 }
 ```
 
-All paths must be regular, non-symlink files inside the supplied canonical
-session workspace. The verifier checks session/category identity, output and
-sent digests, a single source target, and unique capture IDs/output paths. A
-missing or invalid attestation yields `candidate_only` rather than a verified
-flag. Category adapters must create one immutable capture record per target
-interaction and pass its JSON file with `--attestation`.
+The JSON record itself must be atomically created as
+`artifacts/captures/<capture-id>.json` via
+`publish_capture_attestation(workspace, record)`, then supplied by path with
+`--attestation`. All record, output, and sent paths must be regular,
+non-symlink files inside the supplied canonical session workspace. The common
+verifier opens each file once through descriptor-relative `O_NOFOLLOW` walks;
+all digests, candidate matching, and echo checks use exactly those bytes. It
+also checks session/category identity, one source target, unique capture IDs,
+canonical relative output paths, and `(st_dev, st_ino)` identities, so hardlink
+or repeated-output aliases cannot satisfy strict reproduction.
+
+A missing, malformed, unreadable, or invalid attestation yields
+`candidate_only` rather than a verified flag; it is not a CLI syntax error.
+Category adapters are the authority that binds `source_target` to their
+authorized interaction. The common layer validates record integrity and
+containment, but cannot authenticate a malicious local writer. Adapters must
+create one immutable capture record per target interaction and pass its JSON
+file with `--attestation`.

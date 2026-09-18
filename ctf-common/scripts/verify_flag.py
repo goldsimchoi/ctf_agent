@@ -19,18 +19,15 @@ def main() -> int:
     try:
         args = parser.parse_args()
         patterns = tuple(item.encode("utf-8") for item in args.pattern) or DEFAULT_PATTERNS
-        attestations = [
-            json.loads(path.read_text(encoding="utf-8")) for path in args.attestation
-        ]
         result = verify_outputs(
             args.output,
             args.sent,
             patterns,
             args.strict,
             workspace=args.workspace,
-            attestations=attestations or None,
+            attestations=args.attestation or None,
         )
-    except (OSError, json.JSONDecodeError, InvalidInput) as exc:
+    except InvalidInput as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))
         return 2
     print(json.dumps(result, ensure_ascii=False))

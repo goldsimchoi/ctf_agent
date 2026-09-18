@@ -10,8 +10,8 @@ import os
 import re
 import secrets
 import stat
-import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -41,6 +41,14 @@ class JsonArgumentParser(argparse.ArgumentParser):
 
     def error(self, message: str) -> None:
         raise InvalidInput(message)
+
+
+@dataclass(frozen=True)
+class OpenedArtifact:
+    path: Path
+    data: bytes
+    device: int
+    inode: int
 
 
 def _utc_now() -> dt.datetime:
@@ -93,6 +101,7 @@ def _reject_symlink_components(path: Path) -> None:
 def _safe_file(path: Path, description: str) -> Path:
     raw = path.expanduser().absolute()
     _reject_symlink_components(raw)
+    descriptor: int | None = None
     try:
         mode = raw.stat().st_mode
     except OSError as exc:
@@ -116,6 +125,38 @@ def _open_directory_nofollow(path: Path) -> int:
         os.close(descriptor)
         raise
     return descriptor
+
+
+def _read_regular_under(root: Path, path: Path, description: str) -> OpenedArtifact:
+    """Read one contained regular file via no-follow directory descriptors."""
+    root = _resolve_directory(root, "artifact root")
+    raw = path.expanduser().absolute()
+    if not _under(raw, root):
+        raise InvalidInput(f"{description} is outside artifact root: {raw}")
+    parts = raw.relative_to(root).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        raise InvalidInput(f"invalid {description} path: {raw}")
+    descriptor = _open_directory_nofollow(root)
+    file_descriptor: int | None = None
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        file_descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=descriptor)
+        metadata = os.fstat(file_descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InvalidInput(f"{description} is not a regular file: {raw}")
+        chunks: list[bytes] = []
+        while block := os.read(file_descriptor, 1024 * 1024):
+            chunks.append(block)
+        return OpenedArtifact(raw, b"".join(chunks), metadata.st_dev, metadata.st_ino)
+    except OSError as exc:
+        raise InvalidInput(f"{description} is unreadable: {raw}") from exc
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(descriptor)
 
 
 def _safe_directory(root: Path, *parts: str) -> Path:
@@ -317,49 +358,70 @@ def _workspace_root(workspace: Path) -> tuple[Path, Path]:
 
 def _finding_paths(common_root: Path) -> tuple[list[Path], dict[str, Any]]:
     root = common_root / "shared" / "findings"
-    if not root.is_dir():
+    descriptor: int | None = None
+    try:
+        descriptor = _open_directory_nofollow(root)
+        owners = sorted(os.listdir(descriptor))
+    except InvalidInput:
         return [], {"count": 0, "reasons": {}}
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     findings: list[Path] = []
     reasons: dict[str, int] = {}
 
     def skip(reason: str) -> None:
         reasons[reason] = reasons.get(reason, 0) + 1
 
-    for path in sorted(root.glob("*/*.json")):
+    for owner_name in owners:
+        owner = root / owner_name
+        owner_fd: int | None = None
         try:
-            payload = json.loads(_safe_file(path, "finding record").read_text(encoding="utf-8"))
-        except (InvalidInput, OSError, json.JSONDecodeError):
+            owner_fd = _open_directory_nofollow(owner)
+            records = sorted(name for name in os.listdir(owner_fd) if name.endswith(".json"))
+        except (InvalidInput, OSError):
             skip("malformed_record")
             continue
-        required = {"schema_version", "created_at", "evidence", "evidence_sha256", "kind", "session_id", "summary"}
-        if (
-            not isinstance(payload, dict)
-            or not required.issubset(payload)
-            or payload.get("schema_version") != 1
-        ):
-            skip("malformed_record")
-            continue
-        owner = path.parent
-        if not isinstance(payload["session_id"], str) or payload["session_id"] != owner.name:
-            skip("invalid_finding_owner")
-            continue
-        try:
-            _workspace_root(common_root / "sessions" / owner.name)
-        except InvalidInput:
-            skip("invalid_finding_owner")
-            continue
-        try:
-            evidence = _safe_file(Path(str(payload["evidence"])), "finding evidence")
-        except InvalidInput:
-            skip("evidence_missing")
-            continue
-        if not _under(evidence, owner):
-            skip("evidence_outside_finding")
-            continue
-        if not isinstance(payload["evidence_sha256"], str) or hashlib.sha256(evidence.read_bytes()).hexdigest() != payload["evidence_sha256"]:
-            skip("evidence_digest_mismatch")
-            continue
-        findings.append(path)
+        finally:
+            if owner_fd is not None:
+                os.close(owner_fd)
+        for record_name in records:
+            path = owner / record_name
+            try:
+                record = _read_regular_under(root, path, "finding record")
+                payload = json.loads(record.data.decode("utf-8"))
+            except (UnicodeDecodeError, InvalidInput, json.JSONDecodeError):
+                skip("malformed_record")
+                continue
+            required = {"schema_version", "created_at", "evidence", "evidence_sha256", "kind", "session_id", "summary"}
+            if (
+                not isinstance(payload, dict)
+                or not required.issubset(payload)
+                or payload.get("schema_version") != 1
+            ):
+                skip("malformed_record")
+                continue
+            if not isinstance(payload["session_id"], str) or payload["session_id"] != owner_name:
+                skip("invalid_finding_owner")
+                continue
+            try:
+                _workspace_root(common_root / "sessions" / owner_name)
+            except InvalidInput:
+                skip("invalid_finding_owner")
+                continue
+            try:
+                evidence_path = Path(str(payload["evidence"])).expanduser().absolute()
+                if not _under(evidence_path, owner):
+                    skip("evidence_outside_finding")
+                    continue
+                evidence = _read_regular_under(owner, evidence_path, "finding evidence")
+            except InvalidInput:
+                skip("evidence_missing")
+                continue
+            if not isinstance(payload["evidence_sha256"], str) or hashlib.sha256(evidence.data).hexdigest() != payload["evidence_sha256"]:
+                skip("evidence_digest_mismatch")
+                continue
+            findings.append(path)
     return findings, {"count": sum(reasons.values()), "reasons": reasons}
 
 
@@ -493,6 +555,24 @@ def publish_finding(workspace: Path, kind: str, evidence: Path, summary: str) ->
     raise CollisionError("could not publish unique finding")
 
 
+def publish_capture_attestation(workspace: Path, attestation: dict[str, Any]) -> Path:
+    """Atomically publish one adapter-authored capture record for verification."""
+    workspace, _ = _workspace_root(workspace)
+    if not isinstance(attestation, dict):
+        raise InvalidInput("capture attestation must be an object")
+    try:
+        capture_id = _validate_explicit_id(str(attestation["capture_id"]))
+    except (InvalidInput, KeyError, TypeError) as exc:
+        raise InvalidInput("capture attestation needs a safe capture_id") from exc
+    destination = _safe_directory(workspace, "artifacts", "captures")
+    path = destination / f"{capture_id}.json"
+    try:
+        _write_new_json(path, attestation)
+    except FileExistsError as exc:
+        raise CollisionError(f"capture attestation already exists: {path}") from exc
+    return path
+
+
 @contextmanager
 def _state_lock(workspace: Path) -> Iterator[None]:
     import fcntl
@@ -574,8 +654,8 @@ def _validate_capture_attestations(
     workspace: Path | None,
     outputs: list[Path],
     sent: list[Path],
-    attestations: list[dict[str, Any]] | None,
-) -> tuple[list[Path], list[Path], str | None]:
+    attestations: list[Path] | None,
+) -> tuple[list[OpenedArtifact], list[OpenedArtifact], str | None]:
     """Validate capture provenance before a candidate can become a flag."""
     if workspace is None or attestations is None:
         return [], [], "missing_capture_attestation"
@@ -589,21 +669,25 @@ def _validate_capture_attestations(
     if len(outputs) != len(attestations):
         return [], [], "invalid_capture_attestation"
     try:
-        safe_sent = [_safe_file(path, "sent evidence") for path in sent]
-        safe_outputs = [_safe_file(path, "capture output") for path in outputs]
+        safe_sent = [_read_regular_under(workspace, path, "sent evidence") for path in sent]
+        safe_outputs = [_read_regular_under(workspace, path, "capture output") for path in outputs]
     except InvalidInput:
         return [], [], "invalid_capture_attestation"
-    if any(not _under(path, workspace) for path in safe_sent + safe_outputs):
-        return [], [], "invalid_capture_attestation"
-    sent_by_path = {str(path): path for path in safe_sent}
+    sent_by_path = {str(item.path): item for item in safe_sent}
     seen_paths: set[str] = set()
+    seen_output_files: set[tuple[int, int]] = set()
     seen_ids: set[str] = set()
-    seen_attestations: set[str] = set()
+    seen_records: set[tuple[int, int]] = set()
     source_targets: set[str] = set()
-    for output, attestation in zip(safe_outputs, attestations, strict=True):
-        if not isinstance(attestation, dict):
-            return [], [], "invalid_capture_attestation"
+    capture_root = workspace / "artifacts" / "captures"
+    for output, attestation_path in zip(safe_outputs, attestations, strict=True):
         try:
+            record = _read_regular_under(capture_root, attestation_path, "capture attestation")
+            if record.path.parent != capture_root or record.path.suffix != ".json":
+                raise InvalidInput("capture attestation is not a capture artifact")
+            attestation = json.loads(record.data.decode("utf-8"))
+            if not isinstance(attestation, dict):
+                raise InvalidInput("capture attestation must be an object")
             capture_id = _validate_explicit_id(str(attestation["capture_id"]))
             output_record = attestation["output"]
             sent_record = attestation["sent"]
@@ -617,25 +701,33 @@ def _validate_capture_attestations(
                 or attestation.get("workspace") != str(workspace)
                 or attestation.get("session_id") != session["session_id"]
                 or attestation.get("category") != session["category"]
-                or output_record.get("path") != str(output)
-                or output_record.get("sha256") != hashlib.sha256(output.read_bytes()).hexdigest()
+                or record.path.name != f"{capture_id}.json"
+                or output_record.get("path") != str(output.path)
+                or output_record.get("sha256") != hashlib.sha256(output.data).hexdigest()
             ):
                 raise InvalidInput("capture attestation does not match output")
-            sent_path = _safe_file(Path(str(sent_record["path"])), "attested sent evidence")
+            sent_item = sent_by_path.get(str(Path(str(sent_record["path"])).expanduser().absolute()))
             if (
-                str(sent_path) not in sent_by_path
-                or not _under(sent_path, workspace)
-                or sent_record.get("sha256") != hashlib.sha256(sent_path.read_bytes()).hexdigest()
+                sent_item is None
+                or sent_record.get("sha256") != hashlib.sha256(sent_item.data).hexdigest()
             ):
                 raise InvalidInput("capture attestation does not match sent evidence")
-        except (InvalidInput, KeyError, TypeError):
-            return [], [], "invalid_capture_attestation"
-        attestation_key = json.dumps(attestation, sort_keys=True, separators=(",", ":"))
-        if str(output) in seen_paths or capture_id in seen_ids or attestation_key in seen_attestations:
+        except (UnicodeDecodeError, InvalidInput, KeyError, TypeError, json.JSONDecodeError):
+            return safe_outputs, safe_sent, "invalid_capture_attestation"
+        relative_output = str(output.path.relative_to(workspace))
+        output_identity = (output.device, output.inode)
+        record_identity = (record.device, record.inode)
+        if (
+            relative_output in seen_paths
+            or output_identity in seen_output_files
+            or capture_id in seen_ids
+            or record_identity in seen_records
+        ):
             return [], [], "duplicate_capture_attestation"
-        seen_paths.add(str(output))
+        seen_paths.add(relative_output)
+        seen_output_files.add(output_identity)
         seen_ids.add(capture_id)
-        seen_attestations.add(attestation_key)
+        seen_records.add(record_identity)
         source_targets.add(target.strip())
     if len(source_targets) != 1:
         return [], [], "capture_source_target_mismatch"
@@ -648,24 +740,23 @@ def verify_outputs(
     patterns: tuple[bytes, ...],
     strict: bool,
     workspace: Path | None = None,
-    attestations: list[dict[str, Any]] | None = None,
+    attestations: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Verify attested target captures once (race) or twice (strict), never echoes."""
     if not outputs:
         raise InvalidInput("at least one output is required")
-    try:
-        output_data = [_safe_file(path, "output").read_bytes() for path in outputs]
-        per_output = [_candidates(data, patterns) for data in output_data]
-    except (OSError, re.error) as exc:
-        raise InvalidInput(str(exc)) from exc
-    candidates = set().union(*per_output)
     safe_outputs, safe_sent, attestation_error = _validate_capture_attestations(
         workspace, outputs, sent, attestations
     )
+    try:
+        per_output = [_candidates(item.data, patterns) for item in safe_outputs]
+    except re.error as exc:
+        raise InvalidInput(str(exc)) from exc
+    candidates = set().union(*per_output)
     if attestation_error:
         return _candidate_only(attestation_error, candidates)
-    sent_data = b"\n".join(path.read_bytes() for path in safe_sent)
-    if strict and len(outputs) < 2:
+    sent_data = b"\n".join(item.data for item in safe_sent)
+    if strict and len(safe_outputs) < 2:
         return {"status": "unverified", "reason": "requires_two_clean_reproductions", "flag": None, "reproductions": 0}
     if not candidates:
         return {
