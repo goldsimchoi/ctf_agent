@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import hashlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -426,6 +427,17 @@ class ToolScriptTests(unittest.TestCase):
             sourced = self.run_command("bash", "-c", '. "$1"; printf %s "$PATH"', "bash", str(env_file))
             self.assertEqual(sourced.returncode, 0, sourced.stderr)
             self.assertTrue(sourced.stdout.startswith(f"{ctf_root / '.tools' / 'bin'}:"))
+            managed_bin = ctf_root / ".tools" / "bin"
+            self.write_executable(managed_bin / "managed-tool", "exit 0")
+            unset_path = self.run_command("/bin/bash", "-c", 'set -u; unset PATH; . "$1"; printf "%s|%s" "$PATH" "$(command -v managed-tool)"', "bash", str(env_file))
+            self.assertEqual(unset_path.returncode, 0, unset_path.stderr)
+            self.assertEqual(unset_path.stdout, f"{managed_bin}|{managed_bin / 'managed-tool'}")
+            empty_path = self.run_command("/bin/bash", "-c", 'set -u; PATH=; . "$1"; printf "%s|%s" "$PATH" "$(command -v managed-tool)"', "bash", str(env_file))
+            self.assertEqual(empty_path.returncode, 0, empty_path.stderr)
+            self.assertEqual(empty_path.stdout, f"{managed_bin}|{managed_bin / 'managed-tool'}")
+            inherited_path = self.run_command("/bin/bash", "-c", 'set -u; . "$1"; printf %s "$PATH"', "bash", str(env_file), env={"PATH": "/existing/bin:/another bin"})
+            self.assertEqual(inherited_path.returncode, 0, inherited_path.stderr)
+            self.assertEqual(inherited_path.stdout, f"{managed_bin}:/existing/bin:/another bin")
             managed_lib = ctf_root / ".tools" / "lib"
             unset_libraries = self.run_command("bash", "-c", 'unset LD_LIBRARY_PATH; . "$1"; printf %s "${LD_LIBRARY_PATH-}"', "bash", str(env_file))
             self.assertEqual(unset_libraries.returncode, 0, unset_libraries.stderr)
@@ -489,22 +501,29 @@ class ToolScriptTests(unittest.TestCase):
             managed_lib = ctf_root / ".tools" / "lib"
             managed_bin.mkdir(parents=True)
             managed_lib.mkdir()
-            self.write_executable(
-                managed_bin / "radare2",
-                f'[ "$LD_LIBRARY_PATH" = "{managed_lib}" ] || exit 127\necho "radare2 5.9.9"',
+            (managed_bin / "radare2").write_text(
+                f'#!/bin/bash\n[ "$PATH" = "{managed_bin}" ] || exit 126\n'
+                f'[ "$LD_LIBRARY_PATH" = "{managed_lib}" ] || exit 127\necho "radare2 5.9.9"\n',
+                encoding="utf-8",
             )
+            (managed_bin / "radare2").chmod(0o755)
             config = temporary_path / "config.toml"
             config.write_text("", encoding="utf-8")
-            report = self.checker_report(
-                {
+            result = self.run_command(
+                "/bin/bash", str(CHECKER),
+                env={
                     "CTF_TOOLS_ROOT": str(ctf_root),
                     "CTF_TOOLS_CONFIG": str(config),
                     "CTF_TOOLS_VENV": str(temporary_path / "missing-venv"),
                     "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
                     "CTF_TOOLS_PLAYWRIGHT_CACHE": str(temporary_path / "missing-cache"),
                     "LD_LIBRARY_PATH": "",
-                }
+                    "PATH": "",
+                    "CTF_TOOLS_CHECKER_PYTHON": sys.executable,
+                },
             )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
         self.assertEqual(report["cli"]["radare2"]["status"], "available")
         self.assertEqual(report["cli"]["radare2"]["source"], "managed .tools")
 

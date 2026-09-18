@@ -7,8 +7,9 @@ CTF_ROOT=${CTF_TOOLS_ROOT:-/home/normalone/CTF}
 VENV=${CTF_TOOLS_VENV:-"$CTF_ROOT/.venv"}
 MANAGED_ROOT=${CTF_TOOLS_MANAGED_ROOT:-"$CTF_ROOT/.tools"}
 export CTF_ROOT VENV MANAGED_ROOT
+CHECKER_PYTHON=${CTF_TOOLS_CHECKER_PYTHON:-python3}
 
-exec python3 - <<'PY'
+exec "$CHECKER_PYTHON" - <<'PY'
 import json
 import os
 from pathlib import Path
@@ -81,9 +82,11 @@ def cli(name):
     arguments, pattern = CLI_SPECS[name]
     probe_env = None
     if source == "managed .tools" and name == "radare2":
+        existing_path = os.environ.get("PATH", "")
+        probe_path = str(MANAGED_BIN) if not existing_path else f"{MANAGED_BIN}:{existing_path}"
         existing_library_path = os.environ.get("LD_LIBRARY_PATH", "")
         probe_library_path = str(MANAGED_LIB) if not existing_library_path else f"{MANAGED_LIB}:{existing_library_path}"
-        probe_env = {**os.environ, "LD_LIBRARY_PATH": probe_library_path}
+        probe_env = {**os.environ, "PATH": probe_path, "LD_LIBRARY_PATH": probe_library_path}
     version, error = run_probe([path, *arguments], pattern, env=probe_env)
     if error:
         label = "ProjectDiscovery httpx" if name == "httpx" else name
