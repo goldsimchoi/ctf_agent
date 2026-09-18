@@ -520,29 +520,53 @@ class RevAgentTests(unittest.TestCase):
             def reap(process: subprocess.Popen[str], timeout: float) -> tuple[str, str]:
                 if process.pid in captures:
                     return captures[process.pid]
-                try:
-                    captures[process.pid] = process.communicate(timeout=timeout)
-                except subprocess.TimeoutExpired:
+                deadline = time.monotonic() + timeout
+                terminated = False
+                killed = False
+                while time.monotonic() < deadline and process.poll() is None:
+                    result: tuple[str, str] | None = None
+                    remaining = max(0.01, min(0.1, deadline - time.monotonic()))
                     try:
-                        process.terminate()
-                    except (ProcessLookupError, OSError):
+                        result = process.communicate(timeout=remaining)
+                    except (subprocess.TimeoutExpired, OSError):
                         pass
-                    try:
-                        captures[process.pid] = process.communicate(timeout=1)
-                    except subprocess.TimeoutExpired:
+                    if result is not None and process.returncode is not None:
+                        captures[process.pid] = result
+                        return result
+                    if process.poll() is None and not terminated:
+                        try:
+                            process.terminate()
+                        except (ProcessLookupError, OSError):
+                            pass
+                        terminated = True
+                    elif process.poll() is None and not killed:
                         try:
                             process.kill()
                         except (ProcessLookupError, OSError):
                             pass
-                        try:
-                            captures[process.pid] = process.communicate(timeout=1)
-                        except (subprocess.TimeoutExpired, OSError):
-                            captures[process.pid] = ("", "")
+                        killed = True
                     try:
-                        process.wait(timeout=1)
+                        process.wait(timeout=remaining)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
-                return captures[process.pid]
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except (ProcessLookupError, OSError):
+                        pass
+                    try:
+                        process.wait(timeout=0.2)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+                if process.returncode is not None:
+                    try:
+                        result = process.communicate(timeout=0.2)
+                    except (subprocess.TimeoutExpired, OSError):
+                        result = ("", "")
+                    if process.returncode is not None:
+                        captures[process.pid] = result
+                        return result
+                return ("", "")
 
             try:
                 with lock_path.open("a+", encoding="utf-8") as lock:
