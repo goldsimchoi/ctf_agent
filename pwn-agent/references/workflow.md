@@ -31,19 +31,25 @@ The Lead Solver owns the canonical exploit and final decision.
 
    ```text
    WORKSPACE='/absolute/path/to/session'
-   SOURCE_TARGET="$(python3 -c '
-import json, pathlib, re, sys
+   SOURCE_TARGET="$(
+     python3 - "$WORKSPACE" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
 workspace = pathlib.Path(sys.argv[1]).resolve(strict=True)
 session = json.loads((workspace / "session.json").read_text(encoding="utf-8"))
 manifest = (workspace / "challenge.resolved.yaml").read_text(encoding="utf-8")
 match = re.search(r"^\s*binary\s*:\s*([^#\n]+)", manifest, re.MULTILINE)
 if match is None:
     raise SystemExit("resolved manifest has no binary")
-binary = pathlib.Path(match.group(1).strip().strip("'\\\""))
+binary = pathlib.Path(match.group(1).strip().strip("'\""))
 if binary.is_absolute() or ".." in binary.parts:
     raise SystemExit("resolved manifest binary is not challenge-relative")
 print("local:" + str((pathlib.Path(session["challenge"]) / binary).resolve(strict=True)))
-' "$WORKSPACE")"
+PY
+   )"
    python3 <skill>/scripts/publish_capture.py --workspace "$WORKSPACE" \
      --capture-id run-1 --source-target "$SOURCE_TARGET" \
      --output "$WORKSPACE/transcripts/run-1.recv.bin" \
