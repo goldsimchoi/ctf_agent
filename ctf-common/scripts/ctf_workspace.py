@@ -462,6 +462,13 @@ def verify_outputs(
         key=lambda item: (len(item), item),
     )
     if not independent:
+        if strict and any(item not in sent_data for item in candidates):
+            return {
+                "status": "unverified",
+                "reason": "candidate_not_reproduced",
+                "flag": None,
+                "reproductions": 0,
+            }
         return {"status": "unverified", "reason": "candidate_was_user_input", "flag": None, "reproductions": 0}
     return {
         "status": "verified",

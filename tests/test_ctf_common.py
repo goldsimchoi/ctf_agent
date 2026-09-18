@@ -158,6 +158,17 @@ class CommonWorkspaceTests(unittest.TestCase):
         self.assertEqual(result["flag"], "FLAG{reproduced}")
         self.assertEqual(result["reproductions"], 2)
 
+    def test_strict_verification_reports_clean_single_candidate_as_not_reproduced(self) -> None:
+        outputs = [self.root / f"output-{number}.txt" for number in range(3)]
+        outputs[0].write_bytes(b"FLAG{only_once}\n")
+        outputs[1].write_bytes(b"later output has no candidate\n")
+        outputs[2].write_bytes(b"another output has no candidate\n")
+
+        result = verify_outputs(outputs, [], (rb"FLAG\{[^}\r\n]+\}",), strict=True)
+
+        self.assertEqual(result["status"], "unverified")
+        self.assertEqual(result["reason"], "candidate_not_reproduced")
+
     def test_cli_parse_errors_are_one_json_object_with_exit_two(self) -> None:
         cases = (
             ("init_session.py", str(self.challenge), "--category", "misc"),
