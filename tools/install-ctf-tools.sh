@@ -9,6 +9,7 @@ VENV="$CTF_ROOT/.venv"
 LOCAL_BIN=${CTF_TOOLS_LOCAL_BIN:-/home/normalone/.local/bin}
 LOCAL_OPT=${CTF_TOOLS_LOCAL_OPT:-/home/normalone/.local/opt}
 LOCAL_PREFIX=${CTF_TOOLS_LOCAL_PREFIX:-"$(dirname "$LOCAL_BIN")"}
+MARKER_DIR="$LOCAL_OPT/.ctf-agent-tools"
 R2_REVISION=8e57aff6dc36517bbab2aff199154f099e3471ea
 SQLMAP_REVISION=5365c7e53d03c268b14cfc924398340d1365e863
 NUCLEI_VERSION=3.11.1
@@ -73,14 +74,50 @@ pin_revision() {
 }
 
 disable_managed_exposure() {
-  local label=$1 path=$2
+  local label=$1 path=$2 revision=$3 marker
+  marker="$MARKER_DIR/$label.marker"
+  if "$DRY_RUN"; then
+    note "DRY RUN: would disable only marker-owned $label exposure: $path" >&2
+    return 0
+  fi
   if [[ -e "$path" || -L "$path" ]]; then
-    if rm -f "$path"; then
-      note "DEGRADED: removed untrusted installer-owned $label exposure: $path" >&2
+    if marker_matches "$label" "$path" "$revision"; then
+      if rm -f "$path" && rm -f "$marker"; then
+        note "DEGRADED: removed marker-owned $label exposure: $path" >&2
+      else
+        DEGRADED+=("$label: could not disable marker-owned exposure: $path")
+      fi
     else
-      DEGRADED+=("$label: could not disable installer-owned exposure: $path")
+      DEGRADED+=("$label: unmarked or mismatching local exposure preserved: $path")
+      note "DEGRADED: refusing to remove unmarked or mismatching $label exposure: $path" >&2
     fi
   fi
+}
+
+marker_matches() {
+  local label=$1 path=$2 revision=$3 marker
+  local recorded_path recorded_revision recorded_digest actual_digest
+  marker="$MARKER_DIR/$label.marker"
+  [[ -f "$marker" && -f "$path" ]] || return 1
+  recorded_path=$(awk -F= '$1 == "path" {print substr($0, 6)}' "$marker")
+  recorded_revision=$(awk -F= '$1 == "revision" {print substr($0, 10)}' "$marker")
+  recorded_digest=$(awk -F= '$1 == "sha256" {print substr($0, 8)}' "$marker")
+  actual_digest=$(sha256sum "$path" 2>/dev/null | awk '{print $1}')
+  [[ "$recorded_path" == "$path" && "$recorded_revision" == "$revision" && -n "$recorded_digest" && "$recorded_digest" == "$actual_digest" ]]
+}
+
+write_marker() {
+  local label=$1 path=$2 revision=$3 digest
+  "$DRY_RUN" && return 0
+  digest=$(sha256sum "$path" | awk '{print $1}') || return 1
+  mkdir -p "$MARKER_DIR" || return 1
+  printf 'tool=%s\npath=%s\nrevision=%s\nsha256=%s\n' "$label" "$path" "$revision" "$digest" > "$MARKER_DIR/$label.marker"
+}
+
+sqlmap_wrapper_matches() {
+  local path=$1
+  [[ -f "$path" ]] || return 1
+  diff -q "$path" <(printf '%s\n' '#!/usr/bin/env bash' "exec \"$VENV/bin/python\" \"$LOCAL_OPT/sqlmap/sqlmap.py\" \"\$@\"") >/dev/null 2>&1
 }
 
 ensure_uv_python() {
@@ -179,18 +216,25 @@ install_sqlmap() {
   try_run "official sqlmap checkout" git clone https://github.com/sqlmapproject/sqlmap.git "$sqlmap_dir"
   if [[ ! -d "$sqlmap_dir/.git" ]]; then
     DEGRADED+=("sqlmap: official checkout did not create a Git repository")
-    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap"
+    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION"
     return 0
   fi
   if ! pin_revision "pinned sqlmap revision" "$sqlmap_dir" "$SQLMAP_REVISION"; then
-    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap"
+    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION"
     return 0
   fi
   if "$DRY_RUN"; then
     note "DRY RUN: create $LOCAL_BIN/sqlmap wrapper for $sqlmap_dir/sqlmap.py"
   elif [[ -f "$sqlmap_dir/sqlmap.py" ]]; then
+    if [[ -e "$LOCAL_BIN/sqlmap" ]] && ! marker_matches "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION" && ! sqlmap_wrapper_matches "$LOCAL_BIN/sqlmap"; then
+      DEGRADED+=("sqlmap: unmarked local collision preserved: $LOCAL_BIN/sqlmap")
+      return 0
+    fi
     printf '%s\n' '#!/usr/bin/env bash' "exec \"$VENV/bin/python\" \"$sqlmap_dir/sqlmap.py\" \"\$@\"" > "$LOCAL_BIN/sqlmap"
     chmod +x "$LOCAL_BIN/sqlmap"
+    if ! write_marker "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION"; then
+      DEGRADED+=("sqlmap: wrapper created but ownership marker could not be written")
+    fi
   else
     DEGRADED+=("sqlmap: official checkout did not provide $sqlmap_dir/sqlmap.py")
   fi
@@ -209,15 +253,22 @@ install_radare2() {
   fi
   if [[ ! -d "$r2_dir/.git" ]]; then
     DEGRADED+=("radare2: official checkout did not create a Git repository")
-    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2"
+    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"
     return 0
   fi
   if ! pin_revision "pinned radare2 revision" "$r2_dir" "$R2_REVISION"; then
-    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2"
+    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"
+    return 0
+  fi
+  if [[ -e "$LOCAL_BIN/radare2" ]] && ! marker_matches "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"; then
+    DEGRADED+=("radare2: unmarked local collision preserved: $LOCAL_BIN/radare2")
     return 0
   fi
   if [[ -f "$r2_dir/configure" ]]; then
     try_run "user-local radare2 build" bash -c 'cd "$1" && ./configure --prefix="$2" && make -j"$(nproc)" && make install' _ "$r2_dir" "$LOCAL_PREFIX"
+    if [[ -x "$LOCAL_BIN/radare2" ]] && ! write_marker "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"; then
+      DEGRADED+=("radare2: binary created but ownership marker could not be written")
+    fi
   elif ! "$DRY_RUN"; then
     DEGRADED+=("radare2: official source was unavailable at $r2_dir")
   fi

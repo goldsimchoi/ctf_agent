@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import hashlib
 import subprocess
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install-ctf-tools.sh"
 CHECKER = ROOT / "tools" / "check-ctf-tools.sh"
+SQLMAP_REVISION = "5365c7e53d03c268b14cfc924398340d1365e863"
+R2_REVISION = "8e57aff6dc36517bbab2aff199154f099e3471ea"
 
 REQUIRED_CLIS = (
     "gdb",
@@ -261,6 +264,7 @@ class ToolScriptTests(unittest.TestCase):
             (source / ".git").mkdir()
             (source / "sqlmap.py").write_text("stale source\n", encoding="utf-8")
             self.write_executable(local_bin / "sqlmap", "echo stale sqlmap")
+            self.write_ownership_marker(local_root / "opt", "sqlmap", local_bin / "sqlmap", SQLMAP_REVISION)
             fake_bin = temporary_path / "fake-bin"
             fake_bin.mkdir()
             self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
@@ -289,6 +293,7 @@ class ToolScriptTests(unittest.TestCase):
             marker = temporary_path / "build-ran"
             self.write_executable(source / "configure", f"touch '{marker}'")
             self.write_executable(local_bin / "radare2", "echo stale radare2")
+            self.write_ownership_marker(local_root / "opt", "radare2", local_bin / "radare2", R2_REVISION)
             fake_bin = temporary_path / "fake-bin"
             fake_bin.mkdir()
             self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
@@ -304,6 +309,47 @@ class ToolScriptTests(unittest.TestCase):
                 self.assertIn("pinned radare2 revision", result.stderr)
                 self.assertFalse((local_bin / "radare2").exists())
                 self.assertFalse(marker.exists())
+
+    def test_unmarked_and_dry_run_exposures_are_preserved_on_pin_failure(self) -> None:
+        """Unknown local collisions and dry runs never permit installer-owned deletion."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            for tool in ("sqlmap", "radare2"):
+                local_root = temporary_path / tool / "local"
+                local_bin = local_root / "bin"
+                local_bin.mkdir(parents=True)
+                source = local_root / "opt" / tool
+                source.mkdir(parents=True)
+                (source / ".git").mkdir()
+                exposure = local_bin / tool
+                self.write_executable(exposure, f"echo user-{tool}")
+                before = (exposure.stat().st_ino, exposure.read_bytes())
+                fake_bin = temporary_path / tool / "fake-bin"
+                fake_bin.mkdir()
+                self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
+                environment = {
+                    "PATH": f"{local_bin}:{fake_bin}:/usr/bin:/bin",
+                    "CTF_TOOLS_ROOT": str(temporary_path / tool / "CTF"),
+                    "CTF_TOOLS_LOCAL_BIN": str(local_bin),
+                    "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+                }
+                real = self.run_command("bash", str(INSTALLER), "--component", tool, env=environment)
+                self.assertEqual(real.returncode, 0, real.stderr)
+                self.assertTrue(exposure.exists())
+                self.assertEqual((exposure.stat().st_ino, exposure.read_bytes()), before)
+                dry = self.run_command("bash", str(INSTALLER), "--dry-run", "--component", tool, env=environment)
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertTrue(exposure.exists())
+                self.assertEqual((exposure.stat().st_ino, exposure.read_bytes()), before)
+
+    def write_ownership_marker(self, marker_root: Path, tool: str, exposure: Path, revision: str) -> None:
+        marker_dir = marker_root / ".ctf-agent-tools"
+        marker_dir.mkdir()
+        digest = hashlib.sha256(exposure.read_bytes()).hexdigest()
+        (marker_dir / f"{tool}.marker").write_text(
+            f"tool={tool}\npath={exposure}\nrevision={revision}\nsha256={digest}\n",
+            encoding="utf-8",
+        )
 
     def test_skill_metadata_and_common_initializer_create_category_run_layouts(self) -> None:
         """Skill metadata and the documented common initializer agree on category workspaces."""
