@@ -26,8 +26,20 @@ The Lead Solver owns the canonical exploit and final decision.
      --evidence artifacts/<file> --summary '<verified fact>'
    ```
 
-7. Race mode reports the first non-echoed, target-attributable flag. Use strict
-   verification only for `mode: strict`.
+7. After each target interaction, keep exact sent and received files in the session
+   and publish its immutable attestation before verification:
+
+   ```text
+   python3 <skill>/scripts/publish_capture.py --workspace <workspace> \
+     --capture-id run-1 --source-target local:chall --output transcripts/run-1.recv.bin \
+     --sent transcripts/run-1.sent.bin
+   python3 <skill>/scripts/verify_flag.py --workspace <workspace> \
+     --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin \
+     --attestation artifacts/captures/run-1.json
+   ```
+
+   Race mode reports the first attested non-echoed flag. Use strict verification
+   only for `mode: strict`, with two distinct output/sent/attestation triples.
 
 Do not split routine stages across agents. A short-lived explorer, if genuinely
 needed, uses a separate session and publishes evidence only.

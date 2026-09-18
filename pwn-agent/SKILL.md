@@ -49,12 +49,23 @@ file descriptors, or helpers such as `process.libs()`.
 
 ## Finish
 
-Save sent and received bytes separately. In default `mode: race`, verify and report
-the first source-attributable, non-echoed target flag immediately:
+Save exact sent and received bytes separately in the session, then attest the target
+capture before verification. The pwn adapter, not the verifier, is responsible for
+binding `local:<process>` or `tcp://<host>:<port>` to the interaction:
+
+```text
+python3 <skill>/scripts/publish_capture.py --workspace <workspace> \
+  --capture-id run-1 --source-target tcp://challenge.example:31337 \
+  --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin
+```
+
+In default `mode: race`, verify and report the first source-attributable,
+non-echoed target flag immediately:
 
 ```text
 python3 <skill>/scripts/verify_flag.py --workspace <workspace> \
-  --output transcripts/target.recv.bin --sent transcripts/target.sent.bin
+  --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin \
+  --attestation artifacts/captures/run-1.json
 ```
 
 Stop polishing once it verifies. Only `mode: strict` requires two fresh outputs and

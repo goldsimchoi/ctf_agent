@@ -6,20 +6,32 @@ The helper owns `state.json`; record attempts through its CLI. Keep notes compac
 facts with evidence paths, falsifiable hypotheses, experiments, capabilities, and
 the current strategy. Publish only immutable evidence from the current session.
 
-Save bytes sent separately from bytes received. Race mode accepts one flag matching
-the configured/default pattern from authorized target output when it is not in sent
-bytes:
+Save bytes sent separately from bytes received, then have the pwn adapter publish
+one immutable attestation per target interaction. The verifier never creates an
+attestation from arbitrary files:
+
+```text
+python3 <skill>/scripts/publish_capture.py --workspace <workspace> \
+  --capture-id run-1 --source-target tcp://challenge.example:31337 \
+  --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin
+```
+
+Race mode accepts one flag matching the configured/default pattern from an attested
+authorized target output when it is not in sent bytes:
 
 ```text
 python3 scripts/verify_flag.py --workspace <workspace> \
-  --output transcripts/target.recv.bin --sent transcripts/target.sent.bin
+  --output transcripts/run-1.recv.bin --sent transcripts/run-1.sent.bin \
+  --attestation artifacts/captures/run-1.json
 ```
 
 For `mode: strict`, require two clean outputs:
 
 ```text
 python3 scripts/verify_flag.py --workspace <workspace> \
-  --output transcripts/run1.recv.bin --output transcripts/run2.recv.bin --strict
+  --output transcripts/run1.recv.bin --sent transcripts/run1.sent.bin \
+  --attestation artifacts/captures/run1.json --output transcripts/run2.recv.bin \
+  --sent transcripts/run2.sent.bin --attestation artifacts/captures/run2.json --strict
 ```
 
 Both modes reject echoes. Exit code 0 is verified; exit code 2 is unverified with

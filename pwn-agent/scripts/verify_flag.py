@@ -40,6 +40,7 @@ def main() -> int:
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--output", type=Path, action="append", required=True)
     parser.add_argument("--sent", type=Path, action="append", default=[])
+    parser.add_argument("--attestation", type=Path, action="append", default=[])
     parser.add_argument("--pattern", action="append", default=[])
     parser.add_argument("--strict", action="store_true")
     # The old adapter wrote the JSON response to this optional file.
@@ -56,6 +57,8 @@ def main() -> int:
         command.extend(("--output", str(output)))
     for sent in args.sent:
         command.extend(("--sent", str(sent)))
+    for attestation in args.attestation:
+        command.extend(("--attestation", str(attestation)))
     for pattern in args.pattern:
         command.extend(("--pattern", pattern))
     if args.strict:
