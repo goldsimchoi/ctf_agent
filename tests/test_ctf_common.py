@@ -18,9 +18,13 @@ SCRIPTS_DIR = REPO_ROOT / "ctf-common" / "scripts"
 sys.path.insert(0, str(REPO_ROOT / "ctf-common" / "scripts"))
 
 from ctf_intake import (  # noqa: E402
+    MAX_FIELD_BYTES,
     MAX_STATEMENT_BYTES,
+    IntakeError,
     IntakeRequest,
     read_request_json,
+    render_resolved_manifest,
+    resolve_intake,
 )
 from ctf_workspace import (  # noqa: E402
     BudgetExhausted,
@@ -213,6 +217,130 @@ class CommonWorkspaceTests(unittest.TestCase):
         request = read_request_json(io.BytesIO(encoded))
 
         self.assertEqual(request.statement, statement)
+
+    def test_manifest_renderer_quotes_yaml_indicators_and_implicit_types(self) -> None:
+        values = {
+            "leading_at": "@FLAG",
+            "leading_anchor": "&FLAG",
+            "date_like": "2026-09-19",
+        }
+        intake = resolve_intake("web", IntakeRequest(), {})
+        intake["manifest"].update(values)
+
+        rendered = render_resolved_manifest("quoted-scalars", "web", intake)
+        serialized = {
+            line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+            for line in rendered.splitlines()
+        }
+
+        for key, expected in values.items():
+            with self.subTest(key=key):
+                self.assertTrue(serialized[key].startswith('"'))
+                self.assertEqual(json.loads(serialized[key]), expected)
+
+    def test_legacy_scalar_manifest_preserves_quotes_comments_and_escapes(self) -> None:
+        event = Path(self.temp.name) / "quoted-legacy-event"
+        challenge = event / "challenge"
+        challenge.mkdir(parents=True)
+        (challenge / "chall#one").write_bytes(b"fixture")
+        (challenge / "challenge.yaml").write_text(
+            'id: "quoted\\u002did"\n'
+            "binary: 'chall#one' # selected executable\n"
+            'flag_pattern: "FLAG\\\\{quoted#value\\\\}"\n'
+            'wall_time_seconds: "900"   \n'
+            "mode: race # trailing comment\n",
+            encoding="utf-8",
+        )
+
+        result = run_common_script(
+            "init_session.py", str(challenge), "--category", "rev"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        row = json.loads(result.stdout)
+        stored = json.loads(
+            Path(row["intake"]["request_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(row["challenge_id"], "quoted-id")
+        self.assertEqual(stored["manifest"]["binary"], "chall#one")
+        self.assertEqual(
+            stored["manifest"]["flag_pattern"], r"FLAG\{quoted#value\}"
+        )
+        state = json.loads((Path(row["workspace"]) / "state.json").read_text())
+        self.assertEqual(state["wall_time_seconds"], 900)
+
+    def test_legacy_manifest_rejects_unsupported_yaml_structures(self) -> None:
+        manifests = (
+            "id: nested\nmetadata:\n  owner: admin\n",
+            "id: sequence\ntags: [one, two]\n",
+            "id: block\ndescription: |\n  multiline\n",
+        )
+        for index, manifest in enumerate(manifests):
+            with self.subTest(index=index):
+                event = Path(self.temp.name) / f"unsupported-yaml-{index}"
+                challenge = event / "challenge"
+                challenge.mkdir(parents=True)
+                (challenge / "challenge.yaml").write_text(manifest, encoding="utf-8")
+
+                result = run_common_script(
+                    "init_session.py", str(challenge), "--category", "web"
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+                self.assertFalse((event / "runs").exists())
+
+    def test_conflicting_legacy_target_representations_fail_before_allocation(self) -> None:
+        cases = (
+            (
+                "web",
+                "id: web-conflict\n"
+                "origin: https://box.example\n"
+                "start_url: https://box.example/one\n"
+                "target: https://box.example/two\n",
+            ),
+            (
+                "pwn",
+                "id: pwn-conflict\n"
+                "target: tcp://one.example:31337\n"
+                "protocol: tcp\n"
+                "host: two.example\n"
+                "port: 31337\n",
+            ),
+            (
+                "pwn",
+                "id: pwn-protocol-conflict\n"
+                "target: tcp://one.example:31337\n"
+                "protocol: udp\n"
+                "host: one.example\n"
+                "port: 31337\n",
+            ),
+        )
+        for index, (category, manifest) in enumerate(cases):
+            with self.subTest(category=category, index=index):
+                event = Path(self.temp.name) / f"legacy-target-conflict-{index}"
+                challenge = event / "challenge"
+                challenge.mkdir(parents=True)
+                (challenge / "challenge.yaml").write_text(manifest, encoding="utf-8")
+
+                result = run_common_script(
+                    "init_session.py", str(challenge), "--category", category
+                )
+
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+                self.assertFalse((event / "runs").exists())
+
+    def test_legacy_intake_fields_use_prompt_size_and_control_limits(self) -> None:
+        cases = (
+            ("web", {"target": "https://" + ("x" * MAX_FIELD_BYTES)}),
+            ("rev", {"binary": "chall\x00outside"}),
+            ("web", {"flag_pattern": "x" * (MAX_FIELD_BYTES + 1)}),
+        )
+        for category, legacy in cases:
+            with self.subTest(category=category, field=next(iter(legacy))):
+                with self.assertRaises(IntakeError):
+                    resolve_intake(category, IntakeRequest(), legacy)
 
     def test_request_json_rejects_invalid_shape_size_and_mixed_flags(self) -> None:
         cases = (

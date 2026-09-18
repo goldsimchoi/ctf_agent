@@ -288,6 +288,85 @@ def _event_root_for(challenge: Path, event_root: Path | None) -> Path:
     return root
 
 
+def _quoted_manifest_scalar(value: str, line_number: int) -> str:
+    if value.startswith('"'):
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(value)
+        except json.JSONDecodeError as exc:
+            raise InvalidInput(
+                f"invalid double-quoted manifest scalar on line {line_number}"
+            ) from exc
+        if not isinstance(parsed, str):
+            raise InvalidInput(f"manifest scalar must be a string on line {line_number}")
+    else:
+        characters: list[str] = []
+        index = 1
+        end = -1
+        while index < len(value):
+            if value[index] != "'":
+                characters.append(value[index])
+                index += 1
+                continue
+            if index + 1 < len(value) and value[index + 1] == "'":
+                characters.append("'")
+                index += 2
+                continue
+            end = index + 1
+            break
+        if end < 0:
+            raise InvalidInput(
+                f"unterminated single-quoted manifest scalar on line {line_number}"
+            )
+        parsed = "".join(characters)
+    remainder = value[end:]
+    if remainder.strip() and not (
+        remainder[0] in " \t" and remainder.lstrip().startswith("#")
+    ):
+        raise InvalidInput(f"unsupported manifest syntax on line {line_number}")
+    return parsed
+
+
+def _plain_manifest_scalar(value: str, line_number: int) -> str:
+    comment_at: int | None = None
+    for index, character in enumerate(value):
+        if character == "#" and (index == 0 or value[index - 1].isspace()):
+            comment_at = index
+            break
+    scalar = value[:comment_at].rstrip() if comment_at is not None else value.rstrip()
+    if not scalar:
+        raise InvalidInput(f"manifest value is missing on line {line_number}")
+    if scalar.startswith(("[", "{", "|", ">", "&", "*", "!", "%", "@", "`")):
+        raise InvalidInput(f"unsupported manifest structure on line {line_number}")
+    if re.search(r":\s", scalar):
+        raise InvalidInput(f"unsupported manifest mapping on line {line_number}")
+    return scalar
+
+
+def _parse_manifest_scalars(content: bytes) -> dict[str, str]:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidInput("legacy manifest is not valid UTF-8") from exc
+    values: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line[0].isspace():
+            raise InvalidInput(f"nested manifest structure on line {line_number}")
+        match = re.fullmatch(r"([A-Za-z][A-Za-z0-9_-]*):[ \t]*(.*)", line)
+        if match is None:
+            raise InvalidInput(f"unsupported manifest syntax on line {line_number}")
+        key, encoded = match.groups()
+        if key in values:
+            raise InvalidInput(f"duplicate manifest key on line {line_number}: {key}")
+        if encoded.startswith(("'", '"')):
+            value = _quoted_manifest_scalar(encoded, line_number)
+        else:
+            value = _plain_manifest_scalar(encoded, line_number)
+        values[key] = value
+    return values
+
+
 def _manifest_scalars(challenge: Path) -> dict[str, str]:
     content: bytes | None = None
     descriptor = _open_directory_nofollow(challenge)
@@ -323,16 +402,7 @@ def _manifest_scalars(challenge: Path) -> dict[str, str]:
         os.close(descriptor)
     if content is None:
         return {}
-    values: dict[str, str] = {}
-    for line in content.decode("utf-8", errors="replace").splitlines():
-        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*(?:#.*)?$", line)
-        if not match:
-            continue
-        key, value = match.groups()
-        value = value.strip().strip("'\"")
-        if value and not value.startswith(("[", "{", "|", ">")):
-            values[key] = value
-    return values
+    return _parse_manifest_scalars(content)
 
 
 def _validate_selected_binary(challenge: Path, value: str) -> str:

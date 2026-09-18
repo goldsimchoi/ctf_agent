@@ -185,29 +185,54 @@ def _normalize_pwn_target(target: str) -> dict[str, Any]:
 
 
 def _legacy_web_target(legacy: Mapping[str, str]) -> dict[str, Any] | None:
-    candidate = legacy.get("start_url") or legacy.get("origin") or legacy.get("target")
-    if candidate is None:
+    normalized = {
+        key: _normalize_web_target(legacy[key])
+        for key in ("origin", "start_url", "target")
+        if key in legacy
+    }
+    if not normalized:
         return None
-    normalized = _normalize_web_target(candidate)
-    if "origin" in legacy:
-        declared_origin = _normalize_web_target(legacy["origin"])["origin"]
-        if declared_origin != normalized["origin"]:
-            raise IntakeError("legacy web origin conflicts with its start URL")
-    return normalized
+    if "origin" in normalized and normalized["origin"]["start_url"] not in {
+        normalized["origin"]["origin"],
+        normalized["origin"]["origin"] + "/",
+    }:
+        raise IntakeError("legacy web origin must be an exact origin")
+    origins = {value["origin"] for value in normalized.values()}
+    if len(origins) != 1:
+        raise IntakeError("legacy web target representations conflict")
+    full_targets = {
+        normalized[key]["start_url"]
+        for key in ("start_url", "target")
+        if key in normalized
+    }
+    if len(full_targets) > 1:
+        raise IntakeError("legacy web start URL and target conflict")
+    return normalized.get("start_url") or normalized.get("target") or normalized["origin"]
 
 
 def _legacy_pwn_target(legacy: Mapping[str, str]) -> dict[str, Any] | None:
-    if "target" in legacy:
-        return _normalize_pwn_target(legacy["target"])
+    target = (
+        _normalize_pwn_target(legacy["target"]) if "target" in legacy else None
+    )
     has_host = "host" in legacy
     has_port = "port" in legacy
     if has_host != has_port:
         raise IntakeError("legacy pwn target needs both host and port")
-    if not has_host:
-        return None
-    if legacy.get("protocol", "tcp").lower() != "tcp":
+    if "protocol" in legacy and legacy["protocol"].lower() != "tcp":
         raise IntakeError("legacy pwn target must use tcp")
-    return _normalize_pwn_target(f"nc {legacy['host']} {legacy['port']}")
+    tuple_target = (
+        _normalize_pwn_target(f"nc {legacy['host']} {legacy['port']}")
+        if has_host
+        else None
+    )
+    if target is not None and tuple_target is not None:
+        if target["target"] != tuple_target["target"]:
+            raise IntakeError("legacy pwn target representations conflict")
+    if target is None and tuple_target is None:
+        if "protocol" in legacy:
+            raise IntakeError("legacy pwn protocol has no host and port")
+        return None
+    return target or tuple_target
 
 
 def _reject_authorization_conflict(manifest: Mapping[str, str]) -> None:
@@ -237,6 +262,20 @@ def resolve_intake(
     ):
         raise IntakeError("legacy manifest values must be strings")
     legacy_values = dict(legacy)
+    for name in (
+        "target",
+        "origin",
+        "start_url",
+        "host",
+        "port",
+        "protocol",
+        "binary",
+        "flag_pattern",
+    ):
+        if name in legacy_values:
+            legacy_values[name] = _validate_text(
+                name, legacy_values[name], MAX_FIELD_BYTES, multiline=False
+            )
     if "category" in legacy_values and legacy_values["category"] != category:
         raise IntakeError("prompt category conflicts with legacy manifest category")
 
@@ -365,9 +404,22 @@ def resolve_intake(
     }
 
 
-_PLAIN_YAML = re.compile(r"^[A-Za-z0-9_./:@?&=%+\-]+$")
+_PLAIN_YAML = re.compile(r"^[A-Za-z_][A-Za-z0-9_./+\-]*$")
+_PLAIN_ORIGIN = re.compile(
+    r"^(?:https?|tcp)://(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::\d+)?$"
+)
 _YAML_AMBIGUOUS = frozenset(
-    {"null", "~", "true", "false", "yes", "no", "on", "off", ".nan", ".inf", "-.inf"}
+    {
+        "y",
+        "yes",
+        "n",
+        "no",
+        "true",
+        "false",
+        "on",
+        "off",
+        "null",
+    }
 )
 
 
@@ -375,9 +427,8 @@ def _yaml_scalar(value: str) -> str:
     lowered = value.lower()
     if (
         value
-        and _PLAIN_YAML.fullmatch(value)
+        and (_PLAIN_YAML.fullmatch(value) or _PLAIN_ORIGIN.fullmatch(value))
         and lowered not in _YAML_AMBIGUOUS
-        and not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value)
     ):
         return value
     return json.dumps(value, ensure_ascii=False)
