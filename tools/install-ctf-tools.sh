@@ -120,9 +120,16 @@ write_marker() {
 }
 
 write_managed_env() {
+  local quoted_bin quoted_lib
   "$DRY_RUN" && return 0
+  if [[ "$MANAGED_BIN" == *$'\n'* || "$MANAGED_BIN" == *$'\r'* ]]; then
+    note "DEGRADED: managed tool environment path contains a newline and was rejected" >&2
+    return 1
+  fi
   mkdir -p "$MANAGED_ROOT" || return 1
-  printf '%s\n' '#!/usr/bin/env bash' "export PATH=\"$MANAGED_BIN:\${PATH}\"" > "$ENV_FILE"
+  printf -v quoted_bin '%q' "$MANAGED_BIN"
+  printf -v quoted_lib '%q' "$MANAGED_ROOT/lib"
+  printf '%s\n' '#!/usr/bin/env bash' "export PATH=${quoted_bin}:\"\${PATH}\"" "export LD_LIBRARY_PATH=${quoted_lib}:\"\${LD_LIBRARY_PATH:-}\"" > "$ENV_FILE"
   chmod +x "$ENV_FILE"
 }
 
@@ -176,19 +183,19 @@ install_go_tools() {
     DEGRADED+=("ProjectDiscovery tools: Go is not on PATH")
     return 0
   fi
-  try_run "user-local tool directory" mkdir -p /home/normalone/.local/bin
-  try_run "ffuf" env GOBIN=/home/normalone/.local/bin go install github.com/ffuf/ffuf/v2@v2.1.0
-  try_run "ProjectDiscovery httpx" env GOBIN=/home/normalone/.local/bin go install github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0
-  try_run "gobuster" env GOBIN=/home/normalone/.local/bin go install github.com/OJ/gobuster/v3@v3.8.2
+  try_run "managed Go tool directory" mkdir -p "$MANAGED_BIN"
+  try_run "ffuf" env GOBIN="$MANAGED_BIN" go install github.com/ffuf/ffuf/v2@v2.1.0
+  try_run "ProjectDiscovery httpx" env GOBIN="$MANAGED_BIN" go install github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0
+  try_run "gobuster" env GOBIN="$MANAGED_BIN" go install github.com/OJ/gobuster/v3@v3.8.2
 }
 
 install_nuclei() {
   local temp_dir asset expected actual
-  if command -v nuclei >/dev/null 2>&1; then
+  if [[ -x "$MANAGED_BIN/nuclei" ]] && "$MANAGED_BIN/nuclei" -version 2>&1 | grep -q "Nuclei Engine Version: v${NUCLEI_VERSION}"; then
     return 0
   fi
   if "$DRY_RUN"; then
-    note "DRY RUN: download the official ProjectDiscovery nuclei Linux archive and checksums, verify SHA-256, then install nuclei to /home/normalone/.local/bin"
+    note "DRY RUN: download the official ProjectDiscovery nuclei Linux archive and checksums, verify SHA-256, then install nuclei to $MANAGED_BIN"
     return 0
   fi
   if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
@@ -209,23 +216,20 @@ install_nuclei() {
     rm -rf "$temp_dir"
     return 0
   fi
-  if unzip -q "$temp_dir/nuclei.zip" -d "$temp_dir/unpacked" && install -d /home/normalone/.local/bin && install -m 0755 "$temp_dir/unpacked/nuclei" /home/normalone/.local/bin/nuclei; then
-    note "Installed checksum-verified official nuclei release in /home/normalone/.local/bin"
+  if unzip -q "$temp_dir/nuclei.zip" -d "$temp_dir/unpacked" && install -d "$MANAGED_BIN" && install -m 0755 "$temp_dir/unpacked/nuclei" "$MANAGED_BIN/nuclei" && "$MANAGED_BIN/nuclei" -version 2>&1 | grep -q "Nuclei Engine Version: v${NUCLEI_VERSION}"; then
+    note "Installed checksum-verified official nuclei release in $MANAGED_BIN"
   else
-    DEGRADED+=("nuclei: verified archive could not be unpacked into /home/normalone/.local/bin")
+    DEGRADED+=("nuclei: verified archive could not be installed and probed in $MANAGED_BIN")
   fi
   rm -rf "$temp_dir"
 }
 
 install_sqlmap() {
   local sqlmap_dir="$MANAGED_SRC/sqlmap"
-  local existing
-  existing=$(command -v sqlmap 2>/dev/null || true)
-  if [[ -n "$existing" && "$existing" != "$MANAGED_BIN/sqlmap" ]]; then
-    return 0
-  fi
   try_run "managed sqlmap directory" mkdir -p "$MANAGED_SRC" "$MANAGED_BIN" "$MARKER_DIR"
-  try_run "official sqlmap checkout" git clone https://github.com/sqlmapproject/sqlmap.git "$sqlmap_dir"
+  if [[ ! -e "$sqlmap_dir" ]]; then
+    try_run "official sqlmap checkout" git clone https://github.com/sqlmapproject/sqlmap.git "$sqlmap_dir"
+  fi
   if [[ ! -d "$sqlmap_dir/.git" ]]; then
     DEGRADED+=("sqlmap: official checkout did not create a Git repository")
     disable_managed_exposure "sqlmap" "$MANAGED_BIN/sqlmap" "$SQLMAP_REVISION"
@@ -254,11 +258,6 @@ install_sqlmap() {
 
 install_radare2() {
   local r2_dir="$MANAGED_SRC/radare2"
-  local existing
-  existing=$(command -v radare2 2>/dev/null || true)
-  if [[ -n "$existing" && "$existing" != "$MANAGED_BIN/radare2" ]]; then
-    return 0
-  fi
   try_run "managed radare2 directory" mkdir -p "$MANAGED_SRC" "$MANAGED_BIN" "$MARKER_DIR"
   if [[ ! -d "$r2_dir/.git" ]]; then
     try_run "official radare2 source" git clone https://github.com/radareorg/radare2.git "$r2_dir"

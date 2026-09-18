@@ -5,7 +5,8 @@ set -euo pipefail
 
 CTF_ROOT=${CTF_TOOLS_ROOT:-/home/normalone/CTF}
 VENV=${CTF_TOOLS_VENV:-"$CTF_ROOT/.venv"}
-export CTF_ROOT VENV
+MANAGED_ROOT=${CTF_TOOLS_MANAGED_ROOT:-"$CTF_ROOT/.tools"}
+export CTF_ROOT VENV MANAGED_ROOT
 
 exec python3 - <<'PY'
 import json
@@ -19,7 +20,8 @@ from datetime import datetime, timezone
 
 VENV = Path(os.environ["VENV"])
 VENV_PYTHON = VENV / "bin" / "python"
-MANAGED_BIN = Path(os.environ["CTF_ROOT"]) / ".tools" / "bin"
+MANAGED_BIN = Path(os.environ["MANAGED_ROOT"]) / "bin"
+MANAGED_LIB = Path(os.environ["MANAGED_ROOT"]) / "lib"
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 BAD_OUTPUT = re.compile(r"(?:traceback|\busage:|\berror:|\bexception\b)", re.IGNORECASE)
 FALLBACKS = {
@@ -51,9 +53,9 @@ def degraded(reason, fallback, path=None, version=None):
     return {"status": "degraded", "path": path, "version": version, "reason": reason, "fallback": fallback}
 def available(path, version):
     return {"status": "available", "path": path, "version": version, "reason": None, "fallback": None}
-def run_probe(command, pattern, timeout=10, allow_usage=False):
+def run_probe(command, pattern, timeout=10, allow_usage=False, env=None):
     try:
-        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, check=False, env=env)
     except OSError as error: return None, f"probe OS error ({error.strerror or error.__class__.__name__}): {command[0]}"
     except subprocess.TimeoutExpired: return None, f"probe timed out after {timeout}s: {' '.join(command)}"
     output = ANSI.sub("", result.stdout or "").strip()
@@ -65,18 +67,29 @@ def run_probe(command, pattern, timeout=10, allow_usage=False):
     return match.group(0)[:300], None
 def resolve_command(name):
     managed = MANAGED_BIN / name
-    path = str(managed) if managed.is_file() and os.access(managed, os.X_OK) else shutil.which(name)
+    if managed.is_file() and os.access(managed, os.X_OK): return str(managed), "managed .tools"
+    path = shutil.which(name)
+    if path: return path, "PATH fallback"
     venv_command = VENV / "bin" / name
-    return path or (str(venv_command) if venv_command.is_file() and os.access(venv_command, os.X_OK) else None)
+    return (str(venv_command), "managed venv") if venv_command.is_file() and os.access(venv_command, os.X_OK) else (None, None)
 def cli(name):
-    path = resolve_command(name)
-    if not path: return degraded(f"{name} is not on PATH", FALLBACKS[name])
+    path, source = resolve_command(name)
+    if not path:
+        result = degraded(f"{name} is not on PATH", FALLBACKS[name])
+        result["source"] = None
+        return result
     arguments, pattern = CLI_SPECS[name]
-    version, error = run_probe([path, *arguments], pattern)
+    probe_env = None
+    if source == "managed .tools" and name == "radare2":
+        probe_env = {**os.environ, "LD_LIBRARY_PATH": f"{MANAGED_LIB}:{os.environ.get('LD_LIBRARY_PATH', '')}"}
+    version, error = run_probe([path, *arguments], pattern, env=probe_env)
     if error:
         label = "ProjectDiscovery httpx" if name == "httpx" else name
-        return degraded(f"{label} is present but unusable: {error}", FALLBACKS[name], path)
-    return available(path, version)
+        result = degraded(f"{label} is present but unusable: {error}", FALLBACKS[name], path)
+    else:
+        result = available(path, version)
+    result["source"] = source
+    return result
 def module(name, distribution, fallback):
     if not VENV_PYTHON.is_file(): return degraded(f"managed environment is missing: {VENV_PYTHON}", fallback, str(VENV_PYTHON))
     program = """import importlib, importlib.metadata, json, sys, traceback
