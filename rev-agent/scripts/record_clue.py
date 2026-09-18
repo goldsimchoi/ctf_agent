@@ -110,7 +110,7 @@ def record_hypothesis(workspace: Path, statement: str, falsifying_test: str) -> 
     statement = _text(statement, "hypothesis")
     falsifying_test = _text(falsifying_test, "falsifying test")
     path = Path(paths["hypotheses"])
-    with _lock(path.with_suffix(".lock")):
+    with _lock(Path(paths["rev_root"]) / ".state.lock"):
         payload, entries = _load(path, "hypotheses")
         entry = {
             "id": f"hypothesis-{len(entries) + 1:04d}",
@@ -141,7 +141,7 @@ def record_experiment(
     evidence = _text(evidence, "evidence")
     result = _text(result, "result")
     path = Path(paths["hypotheses"])
-    with _lock(path.with_suffix(".lock")):
+    with _lock(Path(paths["rev_root"]) / ".state.lock"):
         payload, entries = _load(path, "hypotheses")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:

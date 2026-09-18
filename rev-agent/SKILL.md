@@ -53,13 +53,15 @@ pseudocode. Two no-progress hypothesis experiments reject that path and require
 a materially different approach.
 
 Build a solver, keygen, emulator, patch, or candidate early. Run it against the
-target and retain oracle output in `rev/oracle/`; prose-only algorithm
-identification is incomplete. Before every meaningful interaction, use the
-common attempt ledger, and after two no-progress attempts change strategy.
+manifest-authorized local target and retain its sent/output evidence and capture
+attestation; prose-only algorithm identification is incomplete. Before every
+meaningful interaction, use the common attempt ledger, and after two no-progress
+attempts change strategy.
 
 ## Finish
 
-Verify target-attributable output with the common flag verifier. In race mode,
-report the first clean non-echoed flag immediately; strict mode alone needs two
-clean outputs. Then create a short writeup or report the terminal blocker with
-the workspace, executable artifact, and evidence paths.
+Verify only an adapter-created, attested capture with the common flag verifier.
+In race mode, report the first clean non-echoed flag immediately; strict mode
+alone needs two independent output/sent/attestation triples. Then create a short
+writeup or report the terminal blocker with the workspace, executable artifact,
+and evidence paths.

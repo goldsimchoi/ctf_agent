@@ -37,9 +37,12 @@ class RevAgentTests(unittest.TestCase):
         challenge = event_root / "challenges" / "crackme"
         challenge.mkdir(parents=True, exist_ok=True)
         (challenge / "challenge.yaml").write_text(
-            "id: crackme\nauthorized: true\n",
+            "id: crackme\nauthorized: true\nbinary: chall\n",
             encoding="utf-8",
         )
+        target = challenge / "chall"
+        target.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        target.chmod(0o755)
         result = run_script(
             COMMON_SCRIPTS / "init_session.py",
             str(challenge),
@@ -49,6 +52,9 @@ class RevAgentTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         return Path(json.loads(result.stdout)["workspace"])
+
+    def target_path(self, workspace: Path) -> Path:
+        return Path(json.loads((workspace / "session.json").read_text())["challenge"]) / "chall"
 
     def test_metadata_and_challenge_asset_are_structured_for_reversing(self) -> None:
         metadata = yaml.safe_load(
@@ -135,7 +141,7 @@ class RevAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             workspace = self.make_workspace(Path(temp), "rev-oracle")
             init_rev_state(workspace)
-            target = Path(temp) / "target.py"
+            target = self.target_path(workspace)
             target.write_text(
                 "#!/usr/bin/env python3\nimport sys\nprint('accepted:' + sys.stdin.read().strip())\n",
                 encoding="utf-8",
@@ -155,12 +161,16 @@ class RevAgentTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["returncode"], 0)
             self.assertEqual(output.read_text(encoding="utf-8"), "accepted:flag{oracle}\n")
+            attestation = Path(payload["attestation"])
+            record = json.loads(attestation.read_text(encoding="utf-8"))
+            self.assertEqual(record["source_target"], f"local:{target}")
+            self.assertEqual(record["output"]["path"], str(output))
 
     def test_oracle_saves_sent_input_and_rejects_an_echoed_flag(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             workspace = self.make_workspace(Path(temp), "rev-oracle-echo")
             init_rev_state(workspace)
-            target = Path(temp) / "echo.py"
+            target = self.target_path(workspace)
             target.write_text(
                 "#!/usr/bin/env python3\nimport sys\nprint(sys.stdin.read().strip())\n",
                 encoding="utf-8",
@@ -184,13 +194,86 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(payload["verification"]["status"], "unverified")
             self.assertEqual(payload["verification"]["reason"], "candidate_was_user_input")
 
+    def test_oracle_preserves_raw_non_utf8_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-oracle-raw")
+            target = self.target_path(workspace)
+            target.write_text(
+                "#!/usr/bin/env python3\nimport sys\n"
+                "sys.stdout.buffer.write(b'\\xffstdout'); sys.stdout.buffer.flush()\n"
+                "sys.stderr.buffer.write(b'\\x80stderr'); sys.stderr.buffer.flush()\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+
+            result = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace), "--binary", str(target), "--candidate", "input",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(Path(payload["output"]).read_bytes(), b"\xffstdout\x80stderr")
+            self.assertEqual(Path(payload["sent"]).read_bytes(), b"input\n")
+            self.assertTrue(Path(payload["attestation"]).is_file())
+
+    def test_oracle_preserves_partial_raw_output_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-oracle-timeout")
+            target = self.target_path(workspace)
+            target.write_text(
+                "#!/usr/bin/env python3\nimport sys, time\n"
+                "sys.stdout.buffer.write(b'\\xffpartial'); sys.stdout.buffer.flush()\n"
+                "time.sleep(2)\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+
+            result = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace), "--binary", str(target),
+                "--candidate", "input", "--timeout", "0.05",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["timed_out"])
+            self.assertIsNone(payload["returncode"])
+            self.assertEqual(Path(payload["output"]).read_bytes(), b"\xffpartial")
+            self.assertTrue(Path(payload["attestation"]).is_file())
+
+    def test_oracle_rejects_manifest_mismatch_and_symlinked_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-oracle-binding")
+            target = self.target_path(workspace)
+            foreign = root / "foreign.py"
+            foreign.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            foreign.chmod(0o755)
+            mismatch = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace), "--binary", str(foreign), "--candidate", "input",
+            )
+            self.assertEqual(mismatch.returncode, 2)
+            self.assertIn("manifest binary", json.loads(mismatch.stdout)["error"])
+
+            target.unlink()
+            target.symlink_to(foreign)
+            symlink = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace), "--binary", str(target), "--candidate", "input",
+            )
+            self.assertEqual(symlink.returncode, 2)
+            self.assertIn("manifest binary", json.loads(symlink.stdout)["error"])
+            self.assertFalse((workspace / "rev" / "oracle").exists())
+
     def test_oracle_rejects_colliding_evidence_paths_before_running_target(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             workspace = self.make_workspace(root, "rev-oracle-collision")
             init_rev_state(workspace)
             ran = root / "target-ran"
-            target = root / "target.py"
+            target = self.target_path(workspace)
             target.write_text(
                 "#!/usr/bin/env python3\nfrom pathlib import Path\n"
                 f"Path({str(ran)!r}).write_text('ran')\n",
@@ -200,7 +283,6 @@ class RevAgentTests(unittest.TestCase):
             oracle = workspace / "rev" / "oracle"
             for output, sent in ((oracle / "shared.out", oracle / "shared.out"), (oracle / "derived.sent", None)):
                 with self.subTest(output=output.name):
-                    output.write_text("preserve me\n", encoding="utf-8")
                     command = [
                         SKILL_DIR / "assets" / "solver.py",
                         "--workspace", str(workspace),
@@ -214,7 +296,7 @@ class RevAgentTests(unittest.TestCase):
 
                     self.assertEqual(result.returncode, 2)
                     self.assertIn("must differ", json.loads(result.stdout)["error"])
-                    self.assertEqual(output.read_text(encoding="utf-8"), "preserve me\n")
+                    self.assertFalse(output.exists())
                     self.assertFalse(ran.exists())
 
     def test_oracle_does_not_accept_single_run_strict_verification(self) -> None:
@@ -223,7 +305,7 @@ class RevAgentTests(unittest.TestCase):
             workspace = self.make_workspace(root, "rev-oracle-strict")
             init_rev_state(workspace)
             ran = root / "target-ran"
-            target = root / "target.py"
+            target = self.target_path(workspace)
             target.write_text(
                 "#!/usr/bin/env python3\nfrom pathlib import Path\n"
                 f"Path({str(ran)!r}).write_text('ran')\n",
@@ -282,6 +364,43 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(contradiction["hypothesis_id"], hypothesis["id"])
             self.assertEqual(hypotheses["hypotheses"][0]["contradiction_ids"], [contradiction["id"]])
             self.assertEqual(contradictions["contradictions"], [contradiction])
+
+    def test_concurrent_state_cli_updates_keep_all_hypotheses_and_links(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-state-concurrent")
+            base = run_script(
+                SCRIPTS / "record_clue.py", "hypothesis", "--workspace", str(workspace),
+                "--statement", "base hypothesis", "--falsifying-test", "break at base",
+            )
+            self.assertEqual(base.returncode, 0, base.stderr)
+            hypothesis_id = json.loads(base.stdout)["id"]
+            commands = [
+                ["experiment", "--workspace", str(workspace), "--hypothesis-id", hypothesis_id,
+                 "--evidence", "gdb/concurrent.txt", "--result", "reached", "--progress"],
+                ["contradiction", "--workspace", str(workspace), "--hypothesis-id", hypothesis_id,
+                 "--evidence", "gdb/conflict.txt", "--summary", "alternate path"],
+                ["hypothesis", "--workspace", str(workspace), "--statement", "second hypothesis",
+                 "--falsifying-test", "break at second"],
+                ["hypothesis", "--workspace", str(workspace), "--statement", "third hypothesis",
+                 "--falsifying-test", "break at third"],
+            ]
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, str(SCRIPTS / "record_clue.py"), *command],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+                for command in commands
+            ]
+            results = [process.communicate() for process in processes]
+            self.assertTrue(all(process.returncode == 0 for process in processes), results)
+
+            hypotheses = json.loads((workspace / "rev" / "hypotheses.json").read_text())["hypotheses"]
+            contradictions = json.loads((workspace / "rev" / "contradictions.json").read_text())["contradictions"]
+            self.assertEqual(len(hypotheses), 3)
+            self.assertEqual(len({row["id"] for row in hypotheses}), 3)
+            base_row = next(row for row in hypotheses if row["id"] == hypothesis_id)
+            self.assertEqual(len(base_row["experiments"]), 1)
+            self.assertEqual(base_row["contradiction_ids"], [contradictions[0]["id"]])
 
 
 if __name__ == "__main__":

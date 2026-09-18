@@ -11,14 +11,20 @@ and linked contradictions. Do not erase evidence that contradicts an appealing
 theory: record it, then reject an active hypothesis after its second no-progress
 experiment.
 
-Use the target binary as the oracle. Save candidate input separately when it may
-contain a flag, and preserve the target output under `rev/oracle/`. Verify a
-candidate only against target-attributable output with the common verifier:
+Use only the `authorized: true` challenge-relative `binary` in
+`challenge.resolved.yaml` as the oracle. The solver binds `--binary` to that
+regular, non-symlink file, preserves exact sent and raw combined stdout/stderr
+bytes as new files in `rev/oracle/`, and publishes an immutable capture
+attestation at capture time. Arbitrary or unattested files remain
+`candidate_only`; the verifier never creates an attestation.
+
+Verify a captured run with all three evidence paths:
 
 ```text
 python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
   --output <workspace>/rev/oracle/oracle.out \
-  --sent <workspace>/rev/oracle/oracle.sent
+  --sent <workspace>/rev/oracle/oracle.sent \
+  --attestation <workspace>/artifacts/captures/oracle-<id>.json
 ```
 
 `solver.py --verify` performs one race-mode check only. Strict verification
@@ -28,7 +34,9 @@ common verifier:
 ```text
 python3 <ctf-common>/scripts/verify_flag.py --workspace <workspace> \
   --output <workspace>/rev/oracle/run1.out --sent <workspace>/rev/oracle/run1.sent \
+  --attestation <workspace>/artifacts/captures/run1.json \
   --output <workspace>/rev/oracle/run2.out --sent <workspace>/rev/oracle/run2.sent \
+  --attestation <workspace>/artifacts/captures/run2.json \
   --strict
 ```
 

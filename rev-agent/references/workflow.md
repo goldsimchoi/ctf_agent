@@ -16,7 +16,9 @@
    `contradictions.json`. Two experiments with no progress reject the hypothesis
    and require a materially different approach.
 5. Create a candidate input, solver, keygen, emulator, or patch early. Run it
-   against the target binary as the oracle and save output in `rev/oracle/`.
+   against the manifest-authorized local binary as the oracle and save output in
+   `rev/oracle/`. The solver creates sent/output evidence and an attestation in
+   the same capture; do not verify arbitrary files.
    Identifying an algorithm in prose is not completion.
 6. Before meaningful target interaction, call the common attempt ledger. After
    two no-progress attempts, change strategy; publish reusable verified facts
