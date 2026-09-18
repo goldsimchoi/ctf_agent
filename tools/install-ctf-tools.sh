@@ -4,21 +4,27 @@
 # artifacts, while the virtual environment remains at the fixed CTF location.
 set -uo pipefail
 
-CTF_ROOT=/home/normalone/CTF
+CTF_ROOT=${CTF_TOOLS_ROOT:-/home/normalone/CTF}
 VENV="$CTF_ROOT/.venv"
-LOCAL_BIN=/home/normalone/.local/bin
-LOCAL_OPT=/home/normalone/.local/opt
+LOCAL_BIN=${CTF_TOOLS_LOCAL_BIN:-/home/normalone/.local/bin}
+LOCAL_OPT=${CTF_TOOLS_LOCAL_OPT:-/home/normalone/.local/opt}
 R2_REVISION=8e57aff6dc36517bbab2aff199154f099e3471ea
 SQLMAP_REVISION=5365c7e53d03c268b14cfc924398340d1365e863
 NUCLEI_VERSION=3.11.1
 NUCLEI_SHA256=ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6
 DRY_RUN=false
+COMPONENT=all
 DEGRADED=()
 
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=true
-elif [[ $# -ne 0 ]]; then
-  echo "Usage: $0 [--dry-run]" >&2
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=true; shift ;;
+    --component) COMPONENT=${2:-}; shift 2 ;;
+    *) echo "Usage: $0 [--dry-run] [--component {sqlmap|radare2}]" >&2; exit 2 ;;
+  esac
+done
+if [[ "$COMPONENT" != all && "$COMPONENT" != sqlmap && "$COMPONENT" != radare2 ]]; then
+  echo "Usage: $0 [--dry-run] [--component {sqlmap|radare2}]" >&2
   exit 2
 fi
 
@@ -41,6 +47,27 @@ try_run() {
     DEGRADED+=("$label: command failed: $(printf '%q ' "$@")")
     note "DEGRADED: $label (continuing; see tools/check-ctf-tools.sh)" >&2
     return 0
+  fi
+}
+
+pin_revision() {
+  local label=$1 directory=$2 revision=$3 actual
+  if ! run git -C "$directory" checkout --detach "$revision"; then
+    DEGRADED+=("$label: command failed: git -C $directory checkout --detach $revision")
+    note "DEGRADED: $label (component stopped before exposure)" >&2
+    return 1
+  fi
+  if "$DRY_RUN"; then
+    return 0
+  fi
+  actual=$(git -C "$directory" rev-parse HEAD 2>/dev/null) || {
+    DEGRADED+=("$label: could not read checked-out revision")
+    return 1
+  }
+  if [[ "$actual" != "$revision" ]]; then
+    DEGRADED+=("$label: revision mismatch (expected $revision, got $actual)")
+    note "DEGRADED: $label (component stopped before exposure)" >&2
+    return 1
   fi
 }
 
@@ -136,8 +163,12 @@ install_sqlmap() {
   fi
   try_run "sqlmap directory" mkdir -p "$LOCAL_OPT" "$LOCAL_BIN"
   try_run "official sqlmap checkout" git clone https://github.com/sqlmapproject/sqlmap.git "$sqlmap_dir"
-  if [[ -d "$sqlmap_dir/.git" ]]; then
-    try_run "pinned sqlmap revision" git -C "$sqlmap_dir" checkout --detach "$SQLMAP_REVISION"
+  if [[ ! -d "$sqlmap_dir/.git" ]]; then
+    DEGRADED+=("sqlmap: official checkout did not create a Git repository")
+    return 0
+  fi
+  if ! pin_revision "pinned sqlmap revision" "$sqlmap_dir" "$SQLMAP_REVISION"; then
+    return 0
   fi
   if "$DRY_RUN"; then
     note "DRY RUN: create $LOCAL_BIN/sqlmap wrapper for $sqlmap_dir/sqlmap.py"
@@ -158,8 +189,12 @@ install_radare2() {
   if [[ ! -d "$r2_dir/.git" ]]; then
     try_run "official radare2 source" git clone https://github.com/radareorg/radare2.git "$r2_dir"
   fi
-  if [[ -d "$r2_dir/.git" ]]; then
-    try_run "pinned radare2 revision" git -C "$r2_dir" checkout --detach "$R2_REVISION"
+  if [[ ! -d "$r2_dir/.git" ]]; then
+    DEGRADED+=("radare2: official checkout did not create a Git repository")
+    return 0
+  fi
+  if ! pin_revision "pinned radare2 revision" "$r2_dir" "$R2_REVISION"; then
+    return 0
   fi
   if [[ -f "$r2_dir/configure" ]]; then
     try_run "user-local radare2 build" bash -c 'cd "$1" && ./configure --prefix="$2" && make -j"$(nproc)" && make install' _ "$r2_dir" /home/normalone/.local
@@ -175,13 +210,19 @@ if "$DRY_RUN"; then
   note "DRY RUN: native/web/reversing CLIs: gdb radare2 ffuf sqlmap nmap nuclei httpx ltrace binwalk qemu-user gobuster"
 fi
 
-try_run "CTF root directory" mkdir -p "$CTF_ROOT"
-install_native_tools
-ensure_uv_python
-install_go_tools
-install_nuclei
-install_sqlmap
-install_radare2
+if [[ "$COMPONENT" == all ]]; then
+  try_run "CTF root directory" mkdir -p "$CTF_ROOT"
+  install_native_tools
+  ensure_uv_python
+  install_go_tools
+  install_nuclei
+  install_sqlmap
+  install_radare2
+elif [[ "$COMPONENT" == sqlmap ]]; then
+  install_sqlmap
+else
+  install_radare2
+fi
 
 if ((${#DEGRADED[@]})); then
   note "Installation completed with degraded capabilities:"

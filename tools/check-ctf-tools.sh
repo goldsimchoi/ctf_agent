@@ -77,11 +77,21 @@ def cli(name):
     return available(path, version)
 def module(name, distribution, fallback):
     if not VENV_PYTHON.is_file(): return degraded(f"managed environment is missing: {VENV_PYTHON}", fallback, str(VENV_PYTHON))
-    program = "import importlib.metadata,importlib.util,json,sys;name,dist=sys.argv[1:];s=importlib.util.find_spec(name);print(json.dumps({'path':s.origin if s else None,'version':importlib.metadata.version(dist) if s else None}))"
+    program = """import importlib, importlib.metadata, json, sys, traceback
+name, distribution = sys.argv[1:]
+try:
+    imported = importlib.import_module(name)
+    version = getattr(imported, '__version__', None) or importlib.metadata.version(distribution)
+    print(json.dumps({'path': getattr(imported, '__file__', None), 'version': str(version), 'error': None}))
+except Exception as error:
+    print(json.dumps({'path': None, 'version': None, 'error': f'{type(error).__name__}: {error}'}))
+"""
     try:
         result = subprocess.run([str(VENV_PYTHON), "-c", program, name, distribution], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=12, check=False)
-        payload = json.loads(result.stdout) if result.returncode == 0 else {"path": None, "version": None}
-    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError): payload = {"path": None, "version": None}
+        payload = json.loads(result.stdout) if result.returncode == 0 else {"path": None, "version": None, "error": result.stderr.strip()[:300]}
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError): payload = {"path": None, "version": None, "error": "module import probe could not run"}
+    if payload.get("error"):
+        return degraded(f"Python module {name} failed to import in {VENV_PYTHON}: {payload['error']}", fallback, payload.get("path"), payload.get("version"))
     return available(payload["path"], payload["version"]) if payload["path"] else degraded(f"Python module {name} is unavailable in {VENV_PYTHON}", fallback, payload["path"], payload["version"])
 def config_paths():
     return (Path(os.environ["CTF_TOOLS_CONFIG"]),) if os.environ.get("CTF_TOOLS_CONFIG") else (Path("/home/normalone/.codex/config.toml"), Path("/home/normalone/.config/codex/config.toml"))

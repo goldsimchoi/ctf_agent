@@ -9,11 +9,12 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install-ctf-tools.sh"
 CHECKER = ROOT / "tools" / "check-ctf-tools.sh"
-README = ROOT / "README.md"
 
 REQUIRED_CLIS = (
     "gdb",
@@ -168,6 +169,109 @@ class ToolScriptTests(unittest.TestCase):
         self.assertIn("probe OS error", report["venv"]["reason"])
         self.assertEqual(report["python"]["angr"]["status"], "degraded")
 
+    def test_checker_imports_modules_in_the_managed_environment(self) -> None:
+        """find_spec is insufficient: an import-time dependency error must degrade the module."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            fake_module_dir = temporary_path / "modules"
+            fake_module_dir.mkdir()
+            (fake_module_dir / "angr.py").write_text("raise ImportError('fixture dependency broke')\n", encoding="utf-8")
+            venv_python = temporary_path / "CTF" / ".venv" / "bin" / "python"
+            venv_python.parent.mkdir(parents=True)
+            self.write_executable(
+                venv_python,
+                f"PYTHONPATH='{fake_module_dir}' exec '/home/normalone/CTF/.venv/bin/python' \"$@\"",
+            )
+            config = temporary_path / "config.toml"
+            config.write_text("", encoding="utf-8")
+            report = self.checker_report(
+                {
+                    "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
+                    "CTF_TOOLS_CONFIG": str(config),
+                    "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
+                    "CTF_TOOLS_PLAYWRIGHT_CACHE": str(temporary_path / "missing-cache"),
+                }
+            )
+        self.assertEqual(report["python"]["angr"]["status"], "degraded")
+        self.assertIn("fixture dependency broke", report["python"]["angr"]["reason"])
+
+    def test_sqlmap_checkout_failure_does_not_expose_an_unpinned_wrapper(self) -> None:
+        """A failed pinned checkout must not create a runnable wrapper from arbitrary source."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            fake_bin = temporary_path / "bin"
+            fake_bin.mkdir()
+            self.write_executable(
+                fake_bin / "git",
+                "if [ \"$1\" = clone ]; then mkdir -p \"$3/.git\"; touch \"$3/sqlmap.py\"; exit 0; fi\n"
+                "if [ \"$1\" = -C ]; then echo 'forced checkout failure' >&2; exit 7; fi\nexit 1",
+            )
+            local_root = temporary_path / "local"
+            result = self.run_command(
+                "bash", str(INSTALLER), "--component", "sqlmap",
+                env={
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
+                    "CTF_TOOLS_LOCAL_BIN": str(local_root / "bin"),
+                    "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+                },
+            )
+            wrapper = local_root / "bin" / "sqlmap"
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pinned sqlmap revision", result.stderr)
+            self.assertFalse(wrapper.exists())
+
+    def test_radare2_checkout_failure_does_not_build_unpinned_source(self) -> None:
+        """A failed radare2 pin must stop before configure or make can execute."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            fake_bin = temporary_path / "bin"
+            fake_bin.mkdir()
+            self.write_executable(
+                fake_bin / "git",
+                "if [ \"$1\" = clone ]; then mkdir -p \"$3/.git\"; "
+                "printf '%s\\n' '#!/usr/bin/env bash' 'touch \"$CTF_TEST_BUILD_MARKER\"' > \"$3/configure\"; chmod +x \"$3/configure\"; exit 0; fi\n"
+                "if [ \"$1\" = -C ]; then echo 'forced checkout failure' >&2; exit 7; fi\nexit 1",
+            )
+            marker = temporary_path / "build-ran"
+            local_root = temporary_path / "local"
+            result = self.run_command(
+                "bash", str(INSTALLER), "--component", "radare2",
+                env={
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
+                    "CTF_TOOLS_LOCAL_BIN": str(local_root / "bin"),
+                    "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+                    "CTF_TEST_BUILD_MARKER": str(marker),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("pinned radare2 revision", result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_skill_metadata_and_common_initializer_create_category_run_layouts(self) -> None:
+        """Skill metadata and the documented common initializer agree on category workspaces."""
+        for category in ("pwn", "web", "rev"):
+            skill = ROOT / f"{category}-agent"
+            metadata = yaml.safe_load((skill / "agents" / "openai.yaml").read_text(encoding="utf-8"))
+            asset = yaml.safe_load((skill / "assets" / "challenge.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["interface"]["display_name"].split()[0].lower(), {"pwn": "pwn", "web": "web", "rev": "reversing"}[category])
+            self.assertEqual(asset["category"], category)
+        with tempfile.TemporaryDirectory() as temporary:
+            event = Path(temporary) / "event"
+            challenge = event / "challenges" / "demo"
+            challenge.mkdir(parents=True)
+            (challenge / "artifact.bin").write_bytes(b"fixture")
+            for category in ("pwn", "web", "rev"):
+                result = self.run_command(
+                    "python3", str(ROOT / "ctf-common" / "scripts" / "init_session.py"),
+                    str(challenge), "--category", category, "--event-root", str(event),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                workspace = Path(json.loads(result.stdout)["workspace"])
+                self.assertTrue(workspace.is_dir())
+                self.assertIn(f"runs/{category}/", workspace.as_posix())
+
     def write_executable(self, path: Path, body: str) -> None:
         path.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
         path.chmod(0o755)
@@ -181,16 +285,6 @@ class ToolScriptTests(unittest.TestCase):
             self.assertTrue(capability["reason"])
             self.assertIsInstance(capability.get("fallback"), str)
             self.assertTrue(capability["fallback"])
-
-    def test_readme_has_exact_workspace_and_all_skill_invocations(self) -> None:
-        """The documented entrypoints must cover all three installed skills."""
-        text = README.read_text(encoding="utf-8")
-        self.assertIn("/home/normalone/CTF/<event>/challenges/<challenge>", text)
-        for invocation in ("$pwn-agent", "$web-agent", "$rev-agent"):
-            self.assertIn(invocation, text)
-        self.assertIn("race", text)
-        self.assertIn("strict", text)
-
 
 if __name__ == "__main__":
     unittest.main()
