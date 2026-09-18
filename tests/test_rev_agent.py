@@ -520,53 +520,68 @@ class RevAgentTests(unittest.TestCase):
             def reap(process: subprocess.Popen[str], timeout: float) -> tuple[str, str]:
                 if process.pid in captures:
                     return captures[process.pid]
-                deadline = time.monotonic() + timeout
-                terminated = False
-                killed = False
-                while time.monotonic() < deadline and process.poll() is None:
-                    result: tuple[str, str] | None = None
-                    remaining = max(0.01, min(0.1, deadline - time.monotonic()))
+                def collect(wait: float) -> tuple[str, str] | None:
                     try:
-                        result = process.communicate(timeout=remaining)
+                        result = process.communicate(timeout=wait)
                     except (subprocess.TimeoutExpired, OSError):
-                        pass
+                        return None
                     if result is not None and process.returncode is not None:
                         captures[process.pid] = result
                         return result
-                    if process.poll() is None and not terminated:
-                        try:
-                            process.terminate()
-                        except (ProcessLookupError, OSError):
-                            pass
-                        terminated = True
-                    elif process.poll() is None and not killed:
-                        try:
-                            process.kill()
-                        except (ProcessLookupError, OSError):
-                            pass
-                        killed = True
+                    return None
+
+                def capture_or_empty() -> tuple[str, str]:
+                    if process.returncode is not None:
+                        captured = collect(0.1)
+                        if captured is not None:
+                            return captured
+                    return ("", "")
+
+                normal_deadline = time.monotonic() + timeout
+                while time.monotonic() < normal_deadline:
+                    if process.poll() is not None:
+                        return capture_or_empty()
+                    result = collect(max(0.01, min(0.1, normal_deadline - time.monotonic())))
+                    if result is not None:
+                        return result
+
+                if process.poll() is not None:
+                    return capture_or_empty()
+                try:
+                    process.terminate()
+                except (ProcessLookupError, OSError):
+                    pass
+                grace_deadline = time.monotonic() + max(0.1, min(1.0, timeout))
+                while time.monotonic() < grace_deadline:
+                    if process.poll() is not None:
+                        return capture_or_empty()
+                    remaining = max(0.01, min(0.1, grace_deadline - time.monotonic()))
+                    result = collect(remaining)
+                    if result is not None:
+                        return result
                     try:
                         process.wait(timeout=remaining)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
+
                 if process.poll() is None:
                     try:
                         process.kill()
                     except (ProcessLookupError, OSError):
                         pass
+                final_deadline = time.monotonic() + max(0.1, min(1.0, timeout))
+                while time.monotonic() < final_deadline:
+                    if process.poll() is not None:
+                        return capture_or_empty()
+                    remaining = max(0.01, min(0.1, final_deadline - time.monotonic()))
+                    result = collect(remaining)
+                    if result is not None:
+                        return result
                     try:
-                        process.wait(timeout=0.2)
+                        process.wait(timeout=remaining)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
-                if process.returncode is not None:
-                    try:
-                        result = process.communicate(timeout=0.2)
-                    except (subprocess.TimeoutExpired, OSError):
-                        result = ("", "")
-                    if process.returncode is not None:
-                        captures[process.pid] = result
-                        return result
-                return ("", "")
+                return capture_or_empty()
 
             try:
                 with lock_path.open("a+", encoding="utf-8") as lock:
