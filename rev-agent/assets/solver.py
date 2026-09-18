@@ -23,7 +23,10 @@ sys.path.insert(0, str(COMMON))
 from ctf_workspace import (  # noqa: E402
     CollisionError,
     InvalidInput,
+    _open_directory_nofollow,
     _read_regular_under,
+    _safe_directory,
+    _workspace_root,
     publish_capture_attestation,
 )
 
@@ -54,7 +57,7 @@ def _manifest_scalars(data: bytes) -> dict[str, str]:
 
 def _authorized_binary(workspace: Path, supplied: Path) -> tuple[Path, dict[str, Any], Path]:
     """Bind a solver invocation to the manifest's local, non-symlink binary."""
-    workspace = _absolute(workspace)
+    workspace, _ = _workspace_root(workspace)
     session_artifact = _read_regular_under(workspace, workspace / "session.json", "session")
     manifest_artifact = _read_regular_under(
         workspace, workspace / "challenge.resolved.yaml", "resolved manifest"
@@ -97,12 +100,8 @@ def _stable_binary(path: Path, challenge: Path) -> int:
 
 
 def _oracle_directory(workspace: Path) -> tuple[Path, int]:
-    oracle = workspace / "rev" / "oracle"
-    oracle.mkdir(parents=True, exist_ok=True)
-    metadata = os.lstat(oracle)
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise InvalidInput("oracle directory must be a real session-local directory")
-    return oracle, os.open(oracle, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    oracle = _safe_directory(workspace, "rev", "oracle")
+    return oracle, _open_directory_nofollow(oracle)
 
 
 def _new_evidence_path(path: Path, oracle: Path, directory_fd: int, description: str) -> tuple[Path, str]:

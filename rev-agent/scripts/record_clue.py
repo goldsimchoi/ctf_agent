@@ -9,51 +9,108 @@ import fcntl
 import json
 import os
 import re
-import tempfile
+import secrets
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
-from init_rev_state import RevStateError, init_rev_state, session_workspace
+from init_rev_state import RevStateError, init_rev_state, rev_directory, session_workspace
+
+
+COMMON_SCRIPTS = Path(__file__).resolve().parents[2] / "ctf-common" / "scripts"
+sys.path.insert(0, str(COMMON_SCRIPTS))
+from ctf_workspace import InvalidInput, _open_directory_nofollow, _read_regular_under  # noqa: E402
 
 
 @contextmanager
-def _lock(path: Path) -> Iterator[None]:
-    with path.open("a+", encoding="utf-8") as stream:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-
-
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+def _lock(workspace: Path, name: str) -> Iterator[tuple[Path, int]]:
+    """Hold a no-follow lock and its validated reversing directory descriptor."""
+    directory: int | None = None
+    descriptor: int | None = None
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(payload, stream, indent=2, sort_keys=True, ensure_ascii=False)
-            stream.write("\n")
+        rev = rev_directory(workspace)
+        directory = _open_directory_nofollow(rev)
+        descriptor = os.open(
+            name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory
+        )
+        with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
+            descriptor = None
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield rev, directory
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+    except (InvalidInput, OSError) as exc:
+        raise RevStateError("unsafe reversing state lock") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory is not None:
+            os.close(directory)
+
+
+def _json_bytes(payload: dict[str, Any]) -> bytes:
+    return (json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _atomic_json(directory: int, name: str, payload: dict[str, Any]) -> None:
+    """Atomically replace one ledger through an already-held no-follow directory FD."""
+    temporary = f".{name}.{secrets.token_hex(8)}.tmp"
+    try:
+        descriptor = os.open(
+            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=directory,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(_json_bytes(payload))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    except OSError as exc:
+        raise RevStateError("unsafe reversing state write") from exc
+    finally:
         try:
-            os.unlink(temporary)
+            os.unlink(temporary, dir_fd=directory)
         except FileNotFoundError:
             pass
-        raise
+        except OSError:
+            pass
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+def _write_new_json(directory: int, name: str, payload: dict[str, Any]) -> None:
+    """Create a transaction record through the validated directory descriptor."""
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        descriptor = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600,
+            dir_fd=directory,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(_json_bytes(payload))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(directory)
+    except OSError as exc:
+        raise RevStateError("unsafe reversing transaction write") from exc
 
 
-def _transaction_path(paths: dict[str, str]) -> Path:
-    return Path(paths["rev_root"]) / ".state.transaction.json"
+def _remove(directory: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory)
+        os.fsync(directory)
+    except OSError as exc:
+        raise RevStateError("unsafe reversing transaction removal") from exc
+
+
+def _transaction_exists(directory: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RevStateError("unsafe reversing transaction") from exc
 
 
 def _safe_id(value: object) -> bool:
@@ -109,35 +166,49 @@ def _validate_transaction_snapshots(hypotheses: object, contradictions: object) 
             raise ValueError("inconsistent transaction contradiction link")
 
 
-def _recover_transaction(paths: dict[str, str]) -> None:
-    journal = _transaction_path(paths)
-    if not journal.exists():
+def _load(workspace: Path, rev: Path, name: str, key: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    path = rev / name
+    try:
+        payload = json.loads(_read_regular_under(workspace, path, "reversing state").data.decode("utf-8"))
+        entries = payload[key]
+    except (InvalidInput, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RevStateError(f"invalid reversing state: {path}") from exc
+    if not isinstance(payload, dict) or not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise RevStateError(f"invalid reversing state: {path}")
+    return payload, entries
+
+
+def _recover_transaction(workspace: Path, rev: Path, directory: int) -> None:
+    name = ".state.transaction.json"
+    if not _transaction_exists(directory, name):
         return
     try:
-        transaction = json.loads(journal.read_text(encoding="utf-8"))
+        transaction = json.loads(
+            _read_regular_under(workspace, rev / name, "reversing transaction").data.decode("utf-8")
+        )
         hypotheses = transaction["hypotheses"]
         contradictions = transaction["contradictions"]
         if set(transaction) != {"schema_version", "hypotheses", "contradictions"} or transaction.get("schema_version") != 1:
             raise ValueError
         _validate_transaction_snapshots(hypotheses, contradictions)
-    except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RevStateError(f"invalid pending reversing transaction: {journal}") from exc
-    _atomic_json(Path(paths["hypotheses"]), hypotheses)
-    _atomic_json(Path(paths["contradictions"]), contradictions)
-    _fsync_directory(Path(paths["rev_root"]))
-    journal.unlink()
-    _fsync_directory(Path(paths["rev_root"]))
+    except (InvalidInput, UnicodeDecodeError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RevStateError(f"invalid pending reversing transaction: {rev / name}") from exc
+    _atomic_json(directory, "hypotheses.json", hypotheses)
+    _atomic_json(directory, "contradictions.json", contradictions)
+    _remove(directory, name)
 
 
-def _commit_transaction(paths: dict[str, str], hypotheses: dict[str, Any], contradictions: dict[str, Any]) -> None:
-    journal = _transaction_path(paths)
-    _atomic_json(journal, {"schema_version": 1, "hypotheses": hypotheses, "contradictions": contradictions})
-    _fsync_directory(Path(paths["rev_root"]))
-    _atomic_json(Path(paths["hypotheses"]), hypotheses)
-    _atomic_json(Path(paths["contradictions"]), contradictions)
-    _fsync_directory(Path(paths["rev_root"]))
-    journal.unlink()
-    _fsync_directory(Path(paths["rev_root"]))
+def _commit_transaction(
+    directory: int, hypotheses: dict[str, Any], contradictions: dict[str, Any]
+) -> None:
+    name = ".state.transaction.json"
+    _write_new_json(
+        directory, name,
+        {"schema_version": 1, "hypotheses": hypotheses, "contradictions": contradictions},
+    )
+    _atomic_json(directory, "hypotheses.json", hypotheses)
+    _atomic_json(directory, "contradictions.json", contradictions)
+    _remove(directory, name)
 
 
 def _text(value: str, field: str) -> str:
@@ -153,19 +224,6 @@ def _texts(values: Sequence[str] | None, field: str) -> list[str]:
     return [_text(value, field) for value in values]
 
 
-def _load(path: Path, key: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        entries = payload[key]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise RevStateError(f"invalid reversing state: {path}") from exc
-    if not isinstance(payload, dict) or not isinstance(entries, list):
-        raise RevStateError(f"invalid reversing state: {path}")
-    if not all(isinstance(entry, dict) for entry in entries):
-        raise RevStateError(f"invalid reversing state: {path}")
-    return payload, entries
-
-
 def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
@@ -179,13 +237,13 @@ def record_clue(
     next_action: str | None = None,
 ) -> dict[str, Any]:
     """Append one evidence-backed clue and its cheapest discriminating action."""
-    paths = init_rev_state(workspace)
+    workspace = session_workspace(workspace)
+    init_rev_state(workspace)
     evidence = _text(evidence, "evidence")
     summary = _text(summary, "summary")
     action = _text(next_action or "", "next action")
-    path = Path(paths["clues"])
-    with _lock(path.with_suffix(".lock")):
-        payload, entries = _load(path, "clues")
+    with _lock(workspace, ".clues.lock") as (rev, directory):
+        payload, entries = _load(workspace, rev, "clues.json", "clues")
         entry = {
             "id": f"clue-{len(entries) + 1:04d}",
             "evidence": evidence,
@@ -197,20 +255,20 @@ def record_clue(
         }
         entries.append(entry)
         payload["clues"] = entries
-        _atomic_json(path, payload)
+        _atomic_json(directory, "clues.json", payload)
     return entry
 
 
 def record_hypothesis(workspace: Path, statement: str, falsifying_test: str) -> dict[str, Any]:
     """Register an active analysis hypothesis with its required disproof test."""
-    paths = init_rev_state(workspace)
+    workspace = session_workspace(workspace)
+    init_rev_state(workspace)
     statement = _text(statement, "hypothesis")
     falsifying_test = _text(falsifying_test, "falsifying test")
-    path = Path(paths["hypotheses"])
-    with _lock(Path(paths["rev_root"]) / ".state.lock"):
-        _recover_transaction(paths)
-        payload, entries = _load(path, "hypotheses")
-        contradictions, _ = _load(Path(paths["contradictions"]), "contradictions")
+    with _lock(workspace, ".state.lock") as (rev, directory):
+        _recover_transaction(workspace, rev, directory)
+        payload, entries = _load(workspace, rev, "hypotheses.json", "hypotheses")
+        contradictions, _ = _load(workspace, rev, "contradictions.json", "contradictions")
         entry = {
             "id": f"hypothesis-{len(entries) + 1:04d}",
             "statement": statement,
@@ -223,7 +281,7 @@ def record_hypothesis(workspace: Path, statement: str, falsifying_test: str) -> 
         }
         entries.append(entry)
         payload["hypotheses"] = entries
-        _commit_transaction(paths, payload, contradictions)
+        _commit_transaction(directory, payload, contradictions)
     return entry
 
 
@@ -235,15 +293,15 @@ def record_experiment(
     progress: bool = False,
 ) -> dict[str, Any]:
     """Record a falsification attempt; two no-progress attempts reject it."""
-    paths = init_rev_state(workspace)
+    workspace = session_workspace(workspace)
+    init_rev_state(workspace)
     hypothesis_id = _text(hypothesis_id, "hypothesis id")
     evidence = _text(evidence, "evidence")
     result = _text(result, "result")
-    path = Path(paths["hypotheses"])
-    with _lock(Path(paths["rev_root"]) / ".state.lock"):
-        _recover_transaction(paths)
-        payload, entries = _load(path, "hypotheses")
-        contradictions, _ = _load(Path(paths["contradictions"]), "contradictions")
+    with _lock(workspace, ".state.lock") as (rev, directory):
+        _recover_transaction(workspace, rev, directory)
+        payload, entries = _load(workspace, rev, "hypotheses.json", "hypotheses")
+        contradictions, _ = _load(workspace, rev, "contradictions.json", "contradictions")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:
             raise RevStateError(f"unknown hypothesis: {hypothesis_id}")
@@ -263,7 +321,7 @@ def record_experiment(
         if no_progress >= 2:
             hypothesis["status"] = "rejected"
             hypothesis["rejection_reason"] = "two no-progress experiments require a new approach"
-        _commit_transaction(paths, payload, contradictions)
+        _commit_transaction(directory, payload, contradictions)
     return hypothesis
 
 
@@ -271,20 +329,18 @@ def record_contradiction(
     workspace: Path, hypothesis_id: str, evidence: str, summary: str
 ) -> dict[str, Any]:
     """Preserve evidence that conflicts with a live hypothesis without erasing it."""
-    paths = init_rev_state(workspace)
+    workspace = session_workspace(workspace)
+    init_rev_state(workspace)
     hypothesis_id = _text(hypothesis_id, "hypothesis id")
     evidence = _text(evidence, "evidence")
     summary = _text(summary, "contradiction summary")
-    hypotheses_path = Path(paths["hypotheses"])
-    contradictions_path = Path(paths["contradictions"])
-    # A shared lock makes the cross-ledger link consistent for concurrent sessions.
-    with _lock(Path(paths["rev_root"]) / ".state.lock"):
-        _recover_transaction(paths)
-        hypotheses, entries = _load(hypotheses_path, "hypotheses")
+    with _lock(workspace, ".state.lock") as (rev, directory):
+        _recover_transaction(workspace, rev, directory)
+        hypotheses, entries = _load(workspace, rev, "hypotheses.json", "hypotheses")
         hypothesis = next((entry for entry in entries if entry.get("id") == hypothesis_id), None)
         if hypothesis is None:
             raise RevStateError(f"unknown hypothesis: {hypothesis_id}")
-        contradictions, records = _load(contradictions_path, "contradictions")
+        contradictions, records = _load(workspace, rev, "contradictions.json", "contradictions")
         record = {
             "id": f"contradiction-{len(records) + 1:04d}",
             "hypothesis_id": hypothesis_id,
@@ -294,7 +350,7 @@ def record_contradiction(
         }
         records.append(record)
         hypothesis.setdefault("contradiction_ids", []).append(record["id"])
-        _commit_transaction(paths, hypotheses, contradictions)
+        _commit_transaction(directory, hypotheses, contradictions)
     return record
 
 

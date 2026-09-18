@@ -19,6 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 from init_rev_state import init_rev_state  # noqa: E402
 from record_clue import (  # noqa: E402
     record_clue,
+    record_contradiction,
     record_experiment,
     record_hypothesis,
 )
@@ -83,6 +84,53 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(json.loads(Path(state["clues"]).read_text())["clues"], [])
             self.assertEqual(json.loads(Path(state["hypotheses"]).read_text())["hypotheses"], [])
             self.assertEqual(json.loads(Path(state["contradictions"]).read_text())["contradictions"], [])
+
+    def test_init_rejects_a_symlinked_rev_directory_without_writing_outside(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-init-symlink")
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("unchanged", encoding="utf-8")
+            (workspace / "rev").symlink_to(outside, target_is_directory=True)
+
+            with self.assertRaises(ValueError):
+                init_rev_state(workspace)
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+            self.assertEqual(list(outside.iterdir()), [sentinel])
+
+    def test_replaced_rev_directory_rejects_state_and_oracle_operations_without_outside_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.make_workspace(root, "rev-state-symlink")
+            init_rev_state(workspace)
+            hypothesis = record_hypothesis(workspace, "base", "break at base")
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "sentinel"
+            sentinel.write_text("unchanged", encoding="utf-8")
+            rev = workspace / "rev"
+            rev.rename(workspace / "rev-moved")
+            rev.symlink_to(outside, target_is_directory=True)
+
+            for operation in (
+                lambda: record_clue(workspace, "gdb/a", "clue", next_action="trace"),
+                lambda: record_hypothesis(workspace, "second", "break at second"),
+                lambda: record_contradiction(workspace, hypothesis["id"], "gdb/b", "conflict"),
+            ):
+                with self.subTest(operation=operation):
+                    with self.assertRaises(ValueError):
+                        operation()
+            target = self.target_path(workspace)
+            solver = run_script(
+                SKILL_DIR / "assets" / "solver.py", "--workspace", str(workspace),
+                "--binary", str(target), "--candidate", "input",
+            )
+            self.assertEqual(solver.returncode, 2)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "unchanged")
+            self.assertEqual(list(outside.iterdir()), [sentinel])
 
     def test_clue_requires_next_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
