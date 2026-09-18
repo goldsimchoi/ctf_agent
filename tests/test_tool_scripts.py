@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 
@@ -41,7 +42,7 @@ REQUIRED_MODULES = (
 
 
 class ToolScriptTests(unittest.TestCase):
-    def run_command(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def run_command(self, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             args,
             cwd=ROOT,
@@ -49,8 +50,13 @@ class ToolScriptTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", **(env or {})},
         )
+
+    def checker_report(self, env: dict[str, str]) -> dict[str, object]:
+        result = self.run_command("bash", str(CHECKER), env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def test_scripts_are_valid_bash(self) -> None:
         """A shell syntax regression must fail before an installer can mutate a host."""
@@ -63,8 +69,10 @@ class ToolScriptTests(unittest.TestCase):
         result = self.run_command("bash", str(INSTALLER), "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("/home/normalone/CTF/.venv", result.stdout)
-        self.assertIn("pwntools", result.stdout)
+        self.assertIn("pwntools==4.15.0", result.stdout)
+        self.assertIn("github.com/ffuf/ffuf/v2@v2.1.0", result.stdout)
         self.assertIn("nuclei", result.stdout)
+        self.assertNotIn("@latest", result.stdout)
 
     def test_checker_emits_one_json_capability_document(self) -> None:
         """The checker must be machine-readable even when capabilities are absent."""
@@ -84,6 +92,63 @@ class ToolScriptTests(unittest.TestCase):
         for name in ("gdb", "idalib"):
             self.assert_capability(report["mcp"][name])
         self.assert_capability(report["browser"]["chrome"])
+
+    def test_checker_rejects_failed_and_unrelated_cli_probes(self) -> None:
+        """A PATH entry is not a capability when its probe fails or identifies another tool."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            binaries = temporary_path / "bin"
+            binaries.mkdir()
+            self.write_executable(binaries / "ffuf", "exit 7")
+            self.write_executable(binaries / "httpx", "echo 'httpx 0.28.1'; exit 0")
+            self.write_executable(binaries / "gobuster", "echo 'usage: gobuster'; exit 0")
+            config = temporary_path / "config.toml"
+            config.write_text("[mcp_servers.gdb]\ncommand = '/missing/gdb-mcp'\n", encoding="utf-8")
+            stale_cache = temporary_path / "playwright-cache"
+            stale_cache.mkdir()
+            report = self.checker_report(
+                {
+                    "PATH": f"{binaries}:{os.environ['PATH']}",
+                    "CTF_TOOLS_CONFIG": str(config),
+                    "CTF_TOOLS_VENV": str(temporary_path / "missing-venv"),
+                    "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
+                    "CTF_TOOLS_PLAYWRIGHT_CACHE": str(stale_cache),
+                }
+            )
+        self.assertEqual(report["cli"]["ffuf"]["status"], "degraded")
+        self.assertIn("exit", report["cli"]["ffuf"]["reason"])
+        self.assertEqual(report["cli"]["httpx"]["status"], "degraded")
+        self.assertIn("ProjectDiscovery", report["cli"]["httpx"]["reason"])
+        self.assertEqual(report["cli"]["gobuster"]["status"], "degraded")
+        self.assertEqual(report["mcp"]["gdb"]["status"], "degraded")
+        self.assertEqual(report["mcp"]["idalib"]["status"], "degraded")
+        self.assertEqual(report["browser"]["chrome"]["status"], "degraded")
+
+    def test_checker_validates_a_configured_mcp_command(self) -> None:
+        """A configured MCP is available only when its command can execute safely."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            executable = temporary_path / "gdb-mcp"
+            self.write_executable(executable, "echo 'gdb MCP ready'")
+            config = temporary_path / "config.toml"
+            config.write_text(
+                f"[mcp_servers.gdb]\ncommand = '{executable}'\nargs = ['--stdio']\n",
+                encoding="utf-8",
+            )
+            report = self.checker_report(
+                {
+                    "CTF_TOOLS_CONFIG": str(config),
+                    "CTF_TOOLS_VENV": str(temporary_path / "missing-venv"),
+                    "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
+                    "CTF_TOOLS_PLAYWRIGHT_CACHE": str(temporary_path / "missing-cache"),
+                }
+            )
+        self.assertEqual(report["mcp"]["gdb"]["status"], "available")
+        self.assertEqual(report["mcp"]["gdb"]["path"], str(executable))
+
+    def write_executable(self, path: Path, body: str) -> None:
+        path.write_text(f"#!/usr/bin/env bash\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
 
     def assert_capability(self, capability: dict[str, object]) -> None:
         self.assertIn(capability["status"], ("available", "degraded"))
