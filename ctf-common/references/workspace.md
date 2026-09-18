@@ -65,3 +65,10 @@ authorized interaction. The common layer validates record integrity and
 containment, but cannot authenticate a malicious local writer. Adapters must
 create one immutable capture record per target interaction and pass its JSON
 file with `--attestation`.
+
+Every artifact read by the common layer (capture records, outputs, sent input,
+shared finding records, and shared evidence) is limited to **4 MiB**. The
+reader checks `fstat` before allocation and its cumulative streamed byte count,
+so sparse or growing files cannot exceed this bound. Oversized verification
+artifacts yield `candidate_only`; oversized shared records or evidence are
+skipped with a reported reason.

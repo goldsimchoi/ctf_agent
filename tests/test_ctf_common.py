@@ -20,6 +20,7 @@ from ctf_workspace import (  # noqa: E402
     BudgetExhausted,
     CollisionError,
     InvalidInput,
+    MAX_ARTIFACT_BYTES,
     create_session,
     publish_capture_attestation,
     publish_finding,
@@ -365,6 +366,60 @@ class CommonWorkspaceTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "candidate_only")
         self.assertEqual(payload["reason"], "invalid_capture_attestation")
+
+    def test_verifier_treats_sparse_oversized_capture_as_invalid_provenance(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, attestation = self.make_capture(row, "capture-one", b"small output\n")
+        with output.open("r+b") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+
+        result = verify_outputs(
+            [output], [sent], (rb"FLAG\{[^}\r\n]+\}",), strict=False,
+            workspace=row["workspace"], attestations=[attestation],
+        )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "invalid_capture_attestation")
+
+    def test_verifier_treats_sparse_oversized_attestation_as_invalid_provenance(self) -> None:
+        row = create_session(self.challenge, "web")
+        output, sent, attestation = self.make_capture(row, "capture-one", b"small output\n")
+        with attestation.open("r+b") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+
+        result = verify_outputs(
+            [output], [sent], (rb"FLAG\{[^}\r\n]+\}",), strict=False,
+            workspace=row["workspace"], attestations=[attestation],
+        )
+
+        self.assertEqual(result["status"], "candidate_only")
+        self.assertEqual(result["reason"], "invalid_capture_attestation")
+
+    def test_initializer_skips_sparse_oversized_shared_evidence(self) -> None:
+        row = create_session(self.challenge, "web")
+        evidence = row["workspace"] / "artifacts" / "response.txt"
+        evidence.write_bytes(b"small evidence")
+        finding = publish_finding(row["workspace"], "endpoint", evidence, "verified endpoint")
+        payload = json.loads(finding.read_text(encoding="utf-8"))
+        with Path(payload["evidence"]).open("r+b") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+
+        next_row = create_session(self.challenge, "web")
+
+        self.assertEqual(next_row["findings"], [])
+        self.assertEqual(next_row["skipped_findings"]["reasons"], {"evidence_oversized": 1})
+
+    def test_initializer_skips_sparse_oversized_shared_record(self) -> None:
+        row = create_session(self.challenge, "web")
+        record = row["workspace"].parents[1] / "shared" / "findings" / row["session_id"] / "oversized.json"
+        record.parent.mkdir()
+        with record.open("wb") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+
+        next_row = create_session(self.challenge, "web")
+
+        self.assertEqual(next_row["findings"], [])
+        self.assertEqual(next_row["skipped_findings"]["reasons"], {"oversized_record": 1})
 
     def test_initializer_skips_tampered_shared_finding_evidence(self) -> None:
         row = create_session(self.challenge, "web")

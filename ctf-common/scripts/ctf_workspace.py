@@ -17,6 +17,7 @@ from typing import Any, Iterator
 
 
 CATEGORIES = {"pwn", "web", "rev"}
+MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 DEFAULT_PATTERNS = (
     rb"FLAG\{[^}\r\n]+\}",
     rb"flag\{[^}\r\n]+\}",
@@ -34,6 +35,10 @@ class CollisionError(FileExistsError):
 
 class BudgetExhausted(RuntimeError):
     """Raised after state has been saved with an exhausted budget."""
+
+
+class ArtifactTooLarge(InvalidInput):
+    """Raised when an artifact exceeds the bounded common-reader contract."""
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -147,8 +152,14 @@ def _read_regular_under(root: Path, path: Path, description: str) -> OpenedArtif
         metadata = os.fstat(file_descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise InvalidInput(f"{description} is not a regular file: {raw}")
+        if metadata.st_size > MAX_ARTIFACT_BYTES:
+            raise ArtifactTooLarge(f"{description} exceeds {MAX_ARTIFACT_BYTES} bytes: {raw}")
         chunks: list[bytes] = []
+        total = 0
         while block := os.read(file_descriptor, 1024 * 1024):
+            total += len(block)
+            if total > MAX_ARTIFACT_BYTES:
+                raise ArtifactTooLarge(f"{description} exceeds {MAX_ARTIFACT_BYTES} bytes: {raw}")
             chunks.append(block)
         return OpenedArtifact(raw, b"".join(chunks), metadata.st_dev, metadata.st_ino)
     except OSError as exc:
@@ -390,6 +401,9 @@ def _finding_paths(common_root: Path) -> tuple[list[Path], dict[str, Any]]:
             try:
                 record = _read_regular_under(root, path, "finding record")
                 payload = json.loads(record.data.decode("utf-8"))
+            except ArtifactTooLarge:
+                skip("oversized_record")
+                continue
             except (UnicodeDecodeError, InvalidInput, json.JSONDecodeError):
                 skip("malformed_record")
                 continue
@@ -415,6 +429,9 @@ def _finding_paths(common_root: Path) -> tuple[list[Path], dict[str, Any]]:
                     skip("evidence_outside_finding")
                     continue
                 evidence = _read_regular_under(owner, evidence_path, "finding evidence")
+            except ArtifactTooLarge:
+                skip("evidence_oversized")
+                continue
             except InvalidInput:
                 skip("evidence_missing")
                 continue
