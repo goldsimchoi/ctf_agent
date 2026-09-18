@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 
 VENV = Path(os.environ["VENV"])
 VENV_PYTHON = VENV / "bin" / "python"
+MANAGED_BIN = Path(os.environ["CTF_ROOT"]) / ".tools" / "bin"
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 BAD_OUTPUT = re.compile(r"(?:traceback|\busage:|\berror:|\bexception\b)", re.IGNORECASE)
 FALLBACKS = {
@@ -63,7 +64,8 @@ def run_probe(command, pattern, timeout=10, allow_usage=False):
     if not match: return None, f"probe output did not identify the required tool: {' '.join(command)}"
     return match.group(0)[:300], None
 def resolve_command(name):
-    path = shutil.which(name)
+    managed = MANAGED_BIN / name
+    path = str(managed) if managed.is_file() and os.access(managed, os.X_OK) else shutil.which(name)
     venv_command = VENV / "bin" / name
     return path or (str(venv_command) if venv_command.is_file() and os.access(venv_command, os.X_OK) else None)
 def cli(name):

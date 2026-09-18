@@ -42,6 +42,14 @@ The checker always writes one JSON capability document. A `degraded` item has a
 specific reason and a safe fallback, so unavailable optional scanners or
 accelerators do not become silent failures.
 
+The installer keeps its pinned sqlmap and radare2 entries under the dedicated
+CTF manager directory, without modifying shell profiles or `~/.local/bin`.
+Enable those entries for one shell after installation:
+
+```bash
+source /home/normalone/CTF/.tools/env.sh
+```
+
 ## Use the skills
 
 Install `pwn-agent`, `web-agent`, `rev-agent`, and `ctf-common` as sibling

@@ -6,10 +6,11 @@ set -uo pipefail
 
 CTF_ROOT=${CTF_TOOLS_ROOT:-/home/normalone/CTF}
 VENV="$CTF_ROOT/.venv"
-LOCAL_BIN=${CTF_TOOLS_LOCAL_BIN:-/home/normalone/.local/bin}
-LOCAL_OPT=${CTF_TOOLS_LOCAL_OPT:-/home/normalone/.local/opt}
-LOCAL_PREFIX=${CTF_TOOLS_LOCAL_PREFIX:-"$(dirname "$LOCAL_BIN")"}
-MARKER_DIR="$LOCAL_OPT/.ctf-agent-tools"
+MANAGED_ROOT=${CTF_TOOLS_MANAGED_ROOT:-"$CTF_ROOT/.tools"}
+MANAGED_BIN="$MANAGED_ROOT/bin"
+MANAGED_SRC="$MANAGED_ROOT/src"
+MARKER_DIR="$MANAGED_ROOT/state"
+ENV_FILE="$MANAGED_ROOT/env.sh"
 R2_REVISION=8e57aff6dc36517bbab2aff199154f099e3471ea
 SQLMAP_REVISION=5365c7e53d03c268b14cfc924398340d1365e863
 NUCLEI_VERSION=3.11.1
@@ -76,6 +77,10 @@ pin_revision() {
 disable_managed_exposure() {
   local label=$1 path=$2 revision=$3 marker
   marker="$MARKER_DIR/$label.marker"
+  if [[ "$path" != "$MANAGED_BIN/$label" ]]; then
+    DEGRADED+=("$label: refused non-managed exposure path: $path")
+    return 0
+  fi
   if "$DRY_RUN"; then
     note "DRY RUN: would disable only marker-owned $label exposure: $path" >&2
     return 0
@@ -114,10 +119,17 @@ write_marker() {
   printf 'tool=%s\npath=%s\nrevision=%s\nsha256=%s\n' "$label" "$path" "$revision" "$digest" > "$MARKER_DIR/$label.marker"
 }
 
+write_managed_env() {
+  "$DRY_RUN" && return 0
+  mkdir -p "$MANAGED_ROOT" || return 1
+  printf '%s\n' '#!/usr/bin/env bash' "export PATH=\"$MANAGED_BIN:\${PATH}\"" > "$ENV_FILE"
+  chmod +x "$ENV_FILE"
+}
+
 sqlmap_wrapper_matches() {
   local path=$1
   [[ -f "$path" ]] || return 1
-  diff -q "$path" <(printf '%s\n' '#!/usr/bin/env bash' "exec \"$VENV/bin/python\" \"$LOCAL_OPT/sqlmap/sqlmap.py\" \"\$@\"") >/dev/null 2>&1
+  diff -q "$path" <(printf '%s\n' '#!/usr/bin/env bash' "exec \"$VENV/bin/python\" \"$MANAGED_SRC/sqlmap/sqlmap.py\" \"\$@\"") >/dev/null 2>&1
 }
 
 ensure_uv_python() {
@@ -164,10 +176,10 @@ install_go_tools() {
     DEGRADED+=("ProjectDiscovery tools: Go is not on PATH")
     return 0
   fi
-  try_run "user-local tool directory" mkdir -p "$LOCAL_BIN"
-  try_run "ffuf" env GOBIN="$LOCAL_BIN" go install github.com/ffuf/ffuf/v2@v2.1.0
-  try_run "ProjectDiscovery httpx" env GOBIN="$LOCAL_BIN" go install github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0
-  try_run "gobuster" env GOBIN="$LOCAL_BIN" go install github.com/OJ/gobuster/v3@v3.8.2
+  try_run "user-local tool directory" mkdir -p /home/normalone/.local/bin
+  try_run "ffuf" env GOBIN=/home/normalone/.local/bin go install github.com/ffuf/ffuf/v2@v2.1.0
+  try_run "ProjectDiscovery httpx" env GOBIN=/home/normalone/.local/bin go install github.com/projectdiscovery/httpx/cmd/httpx@v1.12.0
+  try_run "gobuster" env GOBIN=/home/normalone/.local/bin go install github.com/OJ/gobuster/v3@v3.8.2
 }
 
 install_nuclei() {
@@ -176,7 +188,7 @@ install_nuclei() {
     return 0
   fi
   if "$DRY_RUN"; then
-    note "DRY RUN: download the official ProjectDiscovery nuclei Linux archive and checksums, verify SHA-256, then install nuclei to $LOCAL_BIN"
+    note "DRY RUN: download the official ProjectDiscovery nuclei Linux archive and checksums, verify SHA-256, then install nuclei to /home/normalone/.local/bin"
     return 0
   fi
   if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1 || ! command -v sha256sum >/dev/null 2>&1; then
@@ -197,42 +209,42 @@ install_nuclei() {
     rm -rf "$temp_dir"
     return 0
   fi
-  if unzip -q "$temp_dir/nuclei.zip" -d "$temp_dir/unpacked" && install -d "$LOCAL_BIN" && install -m 0755 "$temp_dir/unpacked/nuclei" "$LOCAL_BIN/nuclei"; then
-    note "Installed checksum-verified official nuclei release in $LOCAL_BIN"
+  if unzip -q "$temp_dir/nuclei.zip" -d "$temp_dir/unpacked" && install -d /home/normalone/.local/bin && install -m 0755 "$temp_dir/unpacked/nuclei" /home/normalone/.local/bin/nuclei; then
+    note "Installed checksum-verified official nuclei release in /home/normalone/.local/bin"
   else
-    DEGRADED+=("nuclei: verified archive could not be unpacked into $LOCAL_BIN")
+    DEGRADED+=("nuclei: verified archive could not be unpacked into /home/normalone/.local/bin")
   fi
   rm -rf "$temp_dir"
 }
 
 install_sqlmap() {
-  local sqlmap_dir="$LOCAL_OPT/sqlmap"
+  local sqlmap_dir="$MANAGED_SRC/sqlmap"
   local existing
   existing=$(command -v sqlmap 2>/dev/null || true)
-  if [[ -n "$existing" && "$existing" != "$LOCAL_BIN/sqlmap" ]]; then
+  if [[ -n "$existing" && "$existing" != "$MANAGED_BIN/sqlmap" ]]; then
     return 0
   fi
-  try_run "sqlmap directory" mkdir -p "$LOCAL_OPT" "$LOCAL_BIN"
+  try_run "managed sqlmap directory" mkdir -p "$MANAGED_SRC" "$MANAGED_BIN" "$MARKER_DIR"
   try_run "official sqlmap checkout" git clone https://github.com/sqlmapproject/sqlmap.git "$sqlmap_dir"
   if [[ ! -d "$sqlmap_dir/.git" ]]; then
     DEGRADED+=("sqlmap: official checkout did not create a Git repository")
-    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION"
+    disable_managed_exposure "sqlmap" "$MANAGED_BIN/sqlmap" "$SQLMAP_REVISION"
     return 0
   fi
   if ! pin_revision "pinned sqlmap revision" "$sqlmap_dir" "$SQLMAP_REVISION"; then
-    disable_managed_exposure "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION"
+    disable_managed_exposure "sqlmap" "$MANAGED_BIN/sqlmap" "$SQLMAP_REVISION"
     return 0
   fi
   if "$DRY_RUN"; then
-    note "DRY RUN: create $LOCAL_BIN/sqlmap wrapper for $sqlmap_dir/sqlmap.py"
+    note "DRY RUN: create $MANAGED_BIN/sqlmap wrapper for $sqlmap_dir/sqlmap.py"
   elif [[ -f "$sqlmap_dir/sqlmap.py" ]]; then
-    if [[ -e "$LOCAL_BIN/sqlmap" ]] && ! marker_matches "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION" && ! sqlmap_wrapper_matches "$LOCAL_BIN/sqlmap"; then
-      DEGRADED+=("sqlmap: unmarked local collision preserved: $LOCAL_BIN/sqlmap")
+    if [[ -e "$MANAGED_BIN/sqlmap" ]] && ! marker_matches "sqlmap" "$MANAGED_BIN/sqlmap" "$SQLMAP_REVISION" && ! sqlmap_wrapper_matches "$MANAGED_BIN/sqlmap"; then
+      DEGRADED+=("sqlmap: unmarked managed collision preserved: $MANAGED_BIN/sqlmap")
       return 0
     fi
-    printf '%s\n' '#!/usr/bin/env bash' "exec \"$VENV/bin/python\" \"$sqlmap_dir/sqlmap.py\" \"\$@\"" > "$LOCAL_BIN/sqlmap"
-    chmod +x "$LOCAL_BIN/sqlmap"
-    if ! write_marker "sqlmap" "$LOCAL_BIN/sqlmap" "$SQLMAP_REVISION"; then
+    printf '%s\n' '#!/usr/bin/env bash' "exec \"$VENV/bin/python\" \"$sqlmap_dir/sqlmap.py\" \"\$@\"" > "$MANAGED_BIN/sqlmap"
+    chmod +x "$MANAGED_BIN/sqlmap"
+    if ! write_marker "sqlmap" "$MANAGED_BIN/sqlmap" "$SQLMAP_REVISION"; then
       DEGRADED+=("sqlmap: wrapper created but ownership marker could not be written")
     fi
   else
@@ -241,32 +253,32 @@ install_sqlmap() {
 }
 
 install_radare2() {
-  local r2_dir="$LOCAL_OPT/radare2"
+  local r2_dir="$MANAGED_SRC/radare2"
   local existing
   existing=$(command -v radare2 2>/dev/null || true)
-  if [[ -n "$existing" && "$existing" != "$LOCAL_BIN/radare2" ]]; then
+  if [[ -n "$existing" && "$existing" != "$MANAGED_BIN/radare2" ]]; then
     return 0
   fi
-  try_run "radare2 directory" mkdir -p "$LOCAL_OPT"
+  try_run "managed radare2 directory" mkdir -p "$MANAGED_SRC" "$MANAGED_BIN" "$MARKER_DIR"
   if [[ ! -d "$r2_dir/.git" ]]; then
     try_run "official radare2 source" git clone https://github.com/radareorg/radare2.git "$r2_dir"
   fi
   if [[ ! -d "$r2_dir/.git" ]]; then
     DEGRADED+=("radare2: official checkout did not create a Git repository")
-    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"
+    disable_managed_exposure "radare2" "$MANAGED_BIN/radare2" "$R2_REVISION"
     return 0
   fi
   if ! pin_revision "pinned radare2 revision" "$r2_dir" "$R2_REVISION"; then
-    disable_managed_exposure "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"
+    disable_managed_exposure "radare2" "$MANAGED_BIN/radare2" "$R2_REVISION"
     return 0
   fi
-  if [[ -e "$LOCAL_BIN/radare2" ]] && ! marker_matches "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"; then
-    DEGRADED+=("radare2: unmarked local collision preserved: $LOCAL_BIN/radare2")
+  if [[ -e "$MANAGED_BIN/radare2" ]] && ! marker_matches "radare2" "$MANAGED_BIN/radare2" "$R2_REVISION"; then
+    DEGRADED+=("radare2: unmarked managed collision preserved: $MANAGED_BIN/radare2")
     return 0
   fi
   if [[ -f "$r2_dir/configure" ]]; then
-    try_run "user-local radare2 build" bash -c 'cd "$1" && ./configure --prefix="$2" && make -j"$(nproc)" && make install' _ "$r2_dir" "$LOCAL_PREFIX"
-    if [[ -x "$LOCAL_BIN/radare2" ]] && ! write_marker "radare2" "$LOCAL_BIN/radare2" "$R2_REVISION"; then
+    try_run "managed radare2 build" bash -c 'cd "$1" && ./configure --prefix="$2" && make -j"$(nproc)" && make install' _ "$r2_dir" "$MANAGED_ROOT"
+    if [[ -x "$MANAGED_BIN/radare2" ]] && ! write_marker "radare2" "$MANAGED_BIN/radare2" "$R2_REVISION"; then
       DEGRADED+=("radare2: binary created but ownership marker could not be written")
     fi
   elif ! "$DRY_RUN"; then
@@ -279,6 +291,10 @@ if "$DRY_RUN"; then
   note "DRY RUN: no package manager, filesystem, or browser changes will be made."
   note "DRY RUN: required Python capabilities: pwntools angr capstone unicorn z3-solver lief requests httpx playwright"
   note "DRY RUN: native/web/reversing CLIs: gdb radare2 ffuf sqlmap nmap nuclei httpx ltrace binwalk qemu-user gobuster"
+fi
+
+if ! write_managed_env; then
+  DEGRADED+=("managed tool environment: could not write $ENV_FILE")
 fi
 
 if [[ "$COMPONENT" == all ]]; then

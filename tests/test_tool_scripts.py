@@ -256,23 +256,22 @@ class ToolScriptTests(unittest.TestCase):
         """A second run must not trust an existing installer-owned sqlmap wrapper."""
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
-            local_root = temporary_path / "local"
-            local_bin = local_root / "bin"
+            local_root = temporary_path / "CTF"
+            local_bin = local_root / ".tools" / "bin"
             local_bin.mkdir(parents=True)
-            source = local_root / "opt" / "sqlmap"
+            source = local_root / ".tools" / "src" / "sqlmap"
             source.mkdir(parents=True)
             (source / ".git").mkdir()
             (source / "sqlmap.py").write_text("stale source\n", encoding="utf-8")
             self.write_executable(local_bin / "sqlmap", "echo stale sqlmap")
-            self.write_ownership_marker(local_root / "opt", "sqlmap", local_bin / "sqlmap", SQLMAP_REVISION)
+            (local_root / ".tools" / "state").mkdir(parents=True)
+            self.write_dedicated_marker(local_root / ".tools" / "state", "sqlmap", local_bin / "sqlmap", SQLMAP_REVISION)
             fake_bin = temporary_path / "fake-bin"
             fake_bin.mkdir()
             self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
             environment = {
                 "PATH": f"{local_bin}:{fake_bin}:/usr/bin:/bin",
-                "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
-                "CTF_TOOLS_LOCAL_BIN": str(local_bin),
-                "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+                "CTF_TOOLS_ROOT": str(local_root),
             }
             for _ in range(2):
                 result = self.run_command("bash", str(INSTALLER), "--component", "sqlmap", env=environment)
@@ -284,24 +283,23 @@ class ToolScriptTests(unittest.TestCase):
         """A second run must not build or retain an installer-owned unpinned radare2."""
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
-            local_root = temporary_path / "local"
-            local_bin = local_root / "bin"
+            local_root = temporary_path / "CTF"
+            local_bin = local_root / ".tools" / "bin"
             local_bin.mkdir(parents=True)
-            source = local_root / "opt" / "radare2"
+            source = local_root / ".tools" / "src" / "radare2"
             source.mkdir(parents=True)
             (source / ".git").mkdir()
             marker = temporary_path / "build-ran"
             self.write_executable(source / "configure", f"touch '{marker}'")
             self.write_executable(local_bin / "radare2", "echo stale radare2")
-            self.write_ownership_marker(local_root / "opt", "radare2", local_bin / "radare2", R2_REVISION)
+            (local_root / ".tools" / "state").mkdir(parents=True)
+            self.write_dedicated_marker(local_root / ".tools" / "state", "radare2", local_bin / "radare2", R2_REVISION)
             fake_bin = temporary_path / "fake-bin"
             fake_bin.mkdir()
             self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
             environment = {
                 "PATH": f"{local_bin}:{fake_bin}:/usr/bin:/bin",
-                "CTF_TOOLS_ROOT": str(temporary_path / "CTF"),
-                "CTF_TOOLS_LOCAL_BIN": str(local_bin),
-                "CTF_TOOLS_LOCAL_OPT": str(local_root / "opt"),
+                "CTF_TOOLS_ROOT": str(local_root),
             }
             for _ in range(2):
                 result = self.run_command("bash", str(INSTALLER), "--component", "radare2", env=environment)
@@ -342,6 +340,74 @@ class ToolScriptTests(unittest.TestCase):
                 self.assertTrue(exposure.exists())
                 self.assertEqual((exposure.stat().st_ino, exposure.read_bytes()), before)
 
+    def test_dedicated_managed_bin_never_deletes_shared_user_tool_and_is_preferred(self) -> None:
+        """A failed pin disables only marker-owned CTF .tools exposure, never ~/.local/bin."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            ctf_root = temporary_path / "CTF"
+            managed_bin = ctf_root / ".tools" / "bin"
+            state = ctf_root / ".tools" / "state"
+            source = ctf_root / ".tools" / "src" / "sqlmap"
+            shared_bin = temporary_path / "shared-bin"
+            for directory in (managed_bin, state, source, shared_bin):
+                directory.mkdir(parents=True, exist_ok=True)
+            (source / ".git").mkdir()
+            (source / "sqlmap.py").write_text("stale source\n", encoding="utf-8")
+            dedicated = managed_bin / "sqlmap"
+            shared = shared_bin / "sqlmap"
+            self.write_executable(dedicated, "echo managed sqlmap")
+            self.write_executable(shared, "echo user sqlmap")
+            self.write_dedicated_marker(state, "sqlmap", dedicated, SQLMAP_REVISION)
+            shared_before = (shared.stat().st_ino, shared.read_bytes())
+            fake_bin = temporary_path / "fake-bin"
+            fake_bin.mkdir()
+            self.write_executable(fake_bin / "git", "echo 'forced checkout failure' >&2; exit 7")
+            environment = {"PATH": f"{managed_bin}:{shared_bin}:{fake_bin}:/usr/bin:/bin", "CTF_TOOLS_ROOT": str(ctf_root)}
+            result = self.run_command("bash", str(INSTALLER), "--component", "sqlmap", env=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(dedicated.exists())
+            self.assertTrue(shared.exists())
+            self.assertEqual((shared.stat().st_ino, shared.read_bytes()), shared_before)
+            env_file = ctf_root / ".tools" / "env.sh"
+            env_check = self.run_command("bash", "-n", str(env_file))
+            self.assertEqual(env_check.returncode, 0, env_check.stderr)
+            enabled = self.run_command("bash", "-c", f'. "{env_file}"; printf %s "$PATH"')
+            self.assertTrue(enabled.stdout.startswith(f"{managed_bin}:"))
+            dry = self.run_command("bash", str(INSTALLER), "--dry-run", "--component", "sqlmap", env=environment)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertTrue(shared.exists())
+
+    def test_checker_prefers_dedicated_ctf_tool_bin_over_shared_path(self) -> None:
+        """A valid managed executable is reported from CTF/.tools before a shared PATH twin."""
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_path = Path(temporary)
+            ctf_root = temporary_path / "CTF"
+            managed_bin = ctf_root / ".tools" / "bin"
+            shared_bin = temporary_path / "shared-bin"
+            managed_bin.mkdir(parents=True)
+            shared_bin.mkdir()
+            self.write_executable(managed_bin / "ffuf", "echo 'ffuf version: 2.1.0'")
+            self.write_executable(shared_bin / "ffuf", "echo 'ffuf version: 9.9.9'")
+            config = temporary_path / "config.toml"
+            config.write_text("", encoding="utf-8")
+            report = self.checker_report(
+                {
+                    "CTF_TOOLS_ROOT": str(ctf_root),
+                    "CTF_TOOLS_CONFIG": str(config),
+                    "CTF_TOOLS_BROWSER_COMMANDS": "missing-browser",
+                    "CTF_TOOLS_PLAYWRIGHT_CACHE": str(temporary_path / "missing-cache"),
+                    "PATH": f"{shared_bin}:{os.environ['PATH']}",
+                }
+            )
+        self.assertEqual(report["cli"]["ffuf"]["status"], "available")
+        self.assertEqual(report["cli"]["ffuf"]["path"], str(managed_bin / "ffuf"))
+
+    def write_dedicated_marker(self, state: Path, tool: str, exposure: Path, revision: str) -> None:
+        digest = hashlib.sha256(exposure.read_bytes()).hexdigest()
+        (state / f"{tool}.marker").write_text(
+            f"tool={tool}\npath={exposure}\nrevision={revision}\nsha256={digest}\n",
+            encoding="utf-8",
+        )
     def write_ownership_marker(self, marker_root: Path, tool: str, exposure: Path, revision: str) -> None:
         marker_dir = marker_root / ".ctf-agent-tools"
         marker_dir.mkdir()
