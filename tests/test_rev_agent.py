@@ -362,6 +362,43 @@ class RevAgentTests(unittest.TestCase):
             base = json.loads(hypotheses_path.read_text())["hypotheses"][0]
             self.assertEqual(base["contradiction_ids"], [contradiction["id"]])
 
+    def test_malformed_pending_transaction_preserves_ledgers_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "rev-state-invalid-journal")
+            state = init_rev_state(workspace)
+            record_hypothesis(workspace, "base", "break at base")
+            hypotheses_path = Path(state["hypotheses"])
+            contradictions_path = Path(state["contradictions"])
+            original_hypotheses = hypotheses_path.read_bytes()
+            original_contradictions = contradictions_path.read_bytes()
+            journal = workspace / "rev" / ".state.transaction.json"
+            invalid_journals = [
+                {},
+                {
+                    "schema_version": 1,
+                    "hypotheses": {"schema_version": 1, "hypotheses": [
+                        {"id": "hypothesis-0001", "statement": "a", "falsifying_test": "b",
+                         "status": "active", "no_progress": 0, "experiments": [],
+                         "contradiction_ids": ["contradiction-0001"], "created_at": "now"},
+                        {"id": "hypothesis-0001", "statement": "c", "falsifying_test": "d",
+                         "status": "active", "no_progress": 0, "experiments": [],
+                         "contradiction_ids": [], "created_at": "now"},
+                    ]},
+                    "contradictions": {"schema_version": 1, "contradictions": []},
+                },
+            ]
+            for payload in invalid_journals:
+                with self.subTest(payload=payload):
+                    journal.write_text(json.dumps(payload), encoding="utf-8")
+                    result = run_script(
+                        SCRIPTS / "record_clue.py", "hypothesis", "--workspace", str(workspace),
+                        "--statement", "new", "--falsifying-test", "break at new",
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(hypotheses_path.read_bytes(), original_hypotheses)
+                    self.assertEqual(contradictions_path.read_bytes(), original_contradictions)
+                    self.assertTrue(journal.exists())
+
     def test_oracle_does_not_accept_single_run_strict_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -470,15 +507,7 @@ class RevAgentTests(unittest.TestCase):
             root = Path(temp)
             workspace = self.make_workspace(root, "rev-state-lock")
             base = record_hypothesis(workspace, "base", "break at base")
-            wrapper = root / "ready_exec.py"
-            wrapper.write_text(
-                "import os, sys\nfrom pathlib import Path\n"
-                "Path(sys.argv[1]).write_text('ready')\n"
-                "os.execv(sys.executable, [sys.executable, sys.argv[2], *sys.argv[3:]])\n",
-                encoding="utf-8",
-            )
             lock_path = workspace / "rev" / ".state.lock"
-            ready_paths = [root / "experiment.ready", root / "contradiction.ready"]
             commands = [
                 ["experiment", "--workspace", str(workspace), "--hypothesis-id", base["id"],
                  "--evidence", "gdb/lock.txt", "--result", "reached", "--progress"],
@@ -487,19 +516,28 @@ class RevAgentTests(unittest.TestCase):
             ]
             with lock_path.open("a+", encoding="utf-8") as lock:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                inode = lock_path.stat().st_ino
                 processes = [
                     subprocess.Popen(
-                        [sys.executable, str(wrapper), str(ready), str(SCRIPTS / "record_clue.py"), *command],
+                        [sys.executable, str(SCRIPTS / "record_clue.py"), *command],
                         text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     )
-                    for ready, command in zip(ready_paths, commands, strict=True)
+                    for command in commands
                 ]
-                deadline = time.monotonic() + 2
-                while not all(path.exists() for path in ready_paths) and time.monotonic() < deadline:
+                deadline = time.monotonic() + 3
+                observed: set[int] = set()
+                while time.monotonic() < deadline:
+                    locks = Path("/proc/locks").read_text(encoding="utf-8")
+                    for process in processes:
+                        if process.poll() is None and any(
+                            "-> FLOCK" in line and f" {process.pid} " in line and f":{inode} " in line
+                            for line in locks.splitlines()
+                        ):
+                            observed.add(process.pid)
+                    if len(observed) == len(processes):
+                        break
                     time.sleep(0.01)
-                self.assertTrue(all(path.exists() for path in ready_paths))
-                time.sleep(0.1)
-                self.assertTrue(all(process.poll() is None for process in processes))
+                self.assertEqual(observed, {process.pid for process in processes})
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
             results = [process.communicate(timeout=3) for process in processes]
             self.assertTrue(all(process.returncode == 0 for process in processes), results)

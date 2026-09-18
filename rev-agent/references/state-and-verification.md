@@ -12,6 +12,8 @@ theory: record it, then reject an active hypothesis after its second no-progress
 experiment. Hypothesis, experiment, and contradiction changes share
 `rev/.state.lock`; a pending `rev/.state.transaction.json` is completed before
 the next change so both ledgers recover together after interruption.
+Recovery validates both complete ledgers and their bidirectional links before
+writing either one; an invalid journal is retained and reported for forensics.
 
 Use only the `authorized: true` challenge-relative `binary` in
 `challenge.resolved.yaml` as the oracle. The solver binds `--binary` to that

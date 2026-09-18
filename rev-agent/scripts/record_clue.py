@@ -8,6 +8,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -55,6 +56,59 @@ def _transaction_path(paths: dict[str, str]) -> Path:
     return Path(paths["rev_root"]) / ".state.transaction.json"
 
 
+def _safe_id(value: object) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value))
+
+
+def _validate_transaction_snapshots(hypotheses: object, contradictions: object) -> None:
+    if (
+        not isinstance(hypotheses, dict)
+        or set(hypotheses) != {"schema_version", "hypotheses"}
+        or hypotheses.get("schema_version") != 1
+        or not isinstance(hypotheses["hypotheses"], list)
+        or not isinstance(contradictions, dict)
+        or set(contradictions) != {"schema_version", "contradictions"}
+        or contradictions.get("schema_version") != 1
+        or not isinstance(contradictions["contradictions"], list)
+    ):
+        raise ValueError("invalid transaction ledger shape")
+    hypothesis_ids: set[str] = set()
+    for entry in hypotheses["hypotheses"]:
+        required = {"id", "statement", "falsifying_test", "status", "no_progress", "experiments", "contradiction_ids", "created_at"}
+        if not isinstance(entry, dict) or not required.issubset(entry) or not _safe_id(entry.get("id")):
+            raise ValueError("invalid transaction hypothesis")
+        if entry["id"] in hypothesis_ids or not all(isinstance(entry[field], str) and entry[field].strip() for field in ("statement", "falsifying_test", "created_at")):
+            raise ValueError("invalid transaction hypothesis")
+        if entry["status"] not in {"active", "rejected"} or isinstance(entry["no_progress"], bool) or not isinstance(entry["no_progress"], int) or entry["no_progress"] < 0:
+            raise ValueError("invalid transaction hypothesis")
+        if not isinstance(entry["experiments"], list) or not isinstance(entry["contradiction_ids"], list) or len(set(entry["contradiction_ids"])) != len(entry["contradiction_ids"]):
+            raise ValueError("invalid transaction hypothesis")
+        if not all(_safe_id(value) for value in entry["contradiction_ids"]):
+            raise ValueError("invalid transaction hypothesis")
+        for experiment in entry["experiments"]:
+            if not isinstance(experiment, dict) or not all(isinstance(experiment.get(field), str) and experiment[field].strip() for field in ("evidence", "result", "recorded_at")) or not isinstance(experiment.get("progress"), bool):
+                raise ValueError("invalid transaction experiment")
+        hypothesis_ids.add(entry["id"])
+    contradiction_ids: set[str] = set()
+    links: dict[str, str] = {}
+    for entry in contradictions["contradictions"]:
+        required = {"id", "hypothesis_id", "evidence", "summary", "recorded_at"}
+        if not isinstance(entry, dict) or not required.issubset(entry) or not _safe_id(entry.get("id")) or not _safe_id(entry.get("hypothesis_id")):
+            raise ValueError("invalid transaction contradiction")
+        if entry["id"] in contradiction_ids or entry["hypothesis_id"] not in hypothesis_ids or not all(isinstance(entry[field], str) and entry[field].strip() for field in ("evidence", "summary", "recorded_at")):
+            raise ValueError("invalid transaction contradiction")
+        contradiction_ids.add(entry["id"])
+        links[entry["id"]] = entry["hypothesis_id"]
+    for entry in hypotheses["hypotheses"]:
+        for contradiction_id in entry["contradiction_ids"]:
+            if links.get(contradiction_id) != entry["id"]:
+                raise ValueError("inconsistent transaction contradiction link")
+    for contradiction_id, hypothesis_id in links.items():
+        hypothesis = next(entry for entry in hypotheses["hypotheses"] if entry["id"] == hypothesis_id)
+        if contradiction_id not in hypothesis["contradiction_ids"]:
+            raise ValueError("inconsistent transaction contradiction link")
+
+
 def _recover_transaction(paths: dict[str, str]) -> None:
     journal = _transaction_path(paths)
     if not journal.exists():
@@ -63,8 +117,9 @@ def _recover_transaction(paths: dict[str, str]) -> None:
         transaction = json.loads(journal.read_text(encoding="utf-8"))
         hypotheses = transaction["hypotheses"]
         contradictions = transaction["contradictions"]
-        if transaction.get("schema_version") != 1 or not isinstance(hypotheses, dict) or not isinstance(contradictions, dict):
+        if set(transaction) != {"schema_version", "hypotheses", "contradictions"} or transaction.get("schema_version") != 1:
             raise ValueError
+        _validate_transaction_snapshots(hypotheses, contradictions)
     except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError) as exc:
         raise RevStateError(f"invalid pending reversing transaction: {journal}") from exc
     _atomic_json(Path(paths["hypotheses"]), hypotheses)
