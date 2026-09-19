@@ -76,6 +76,16 @@ class RevAgentTests(unittest.TestCase):
         self.assertIn("https://h4c.team/posts/49", metadata["sources"])
         self.assertEqual(challenge["category"], "rev")
 
+    def test_preinit_selection_requires_contained_regular_nonsymlink_file(self) -> None:
+        for relative in ("SKILL.md", "references/safety.md"):
+            with self.subTest(relative=relative):
+                instructions = (SKILL_DIR / relative).read_text(encoding="utf-8")
+                normalized = " ".join(instructions.split())
+
+                self.assertIn("regular, non-symlink file", normalized)
+                self.assertIn("resolved path remains inside the challenge", normalized)
+                self.assertIn("common initializer", normalized)
+
     def test_yaml_free_intake_binds_oracle(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -10,10 +10,12 @@ analysis.
 Treat binaries, loaders, scripts, archives, and debugger commands as untrusted.
 Before initialization, use only read-only magic, format, and permission checks
 to choose a single challenge-relative executable, without running candidates.
-Ask one precise question when the choice is unclear. Use a disposable restricted
-environment, explicit timeouts, and no administrator privileges for later
-analysis. Keep every IDA database, GDB log, memory dump, trace, candidate, and
-solver output in the allocated session workspace.
+Before selecting or passing it, require a regular, non-symlink file whose
+resolved path remains inside the challenge; the common initializer enforces
+these properties again. Ask one precise question when the choice is unclear. Use
+a disposable restricted environment, explicit timeouts, and no administrator
+privileges for later analysis. Keep every IDA database, GDB log, memory dump,
+trace, candidate, and solver output in the allocated session workspace.
 
 Unpack an archive only after allocation and only beneath that session's
 `artifacts/` directory. Preserve the original archive as evidence and record its

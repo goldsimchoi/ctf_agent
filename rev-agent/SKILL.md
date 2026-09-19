@@ -18,10 +18,12 @@ the target binary is the oracle.
 2. Preserve the entire pasted event statement exactly. Read
    [references/safety.md](references/safety.md), then inspect supplied files
    without executing them: use cheap, read-only magic, format, and permission
-   checks to identify one clear challenge-relative executable. If multiple
-   executables are equally plausible, ask one precise question instead of
-   guessing. Reversing intake is local-only; do not select, probe, or use a
-   network target.
+   checks to identify one clear challenge-relative executable. Before selecting
+   or passing it, require a regular, non-symlink file whose resolved path remains
+   inside the challenge; the common initializer enforces these properties again.
+   If multiple executables are equally plausible, ask one precise question
+   instead of guessing. Reversing intake is local-only; do not select, probe, or
+   use a network target.
 3. Send one normalized JSON object as standard input, never as shell arguments,
    to the common initializer:
 
