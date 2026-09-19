@@ -16,6 +16,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "tools" / "install-ctf-tools.sh"
+SKILL_INSTALLER = ROOT / "tools" / "install-ctf-skills.sh"
 CHECKER = ROOT / "tools" / "check-ctf-tools.sh"
 SQLMAP_REVISION = "5365c7e53d03c268b14cfc924398340d1365e863"
 R2_REVISION = "8e57aff6dc36517bbab2aff199154f099e3471ea"
@@ -65,9 +66,71 @@ class ToolScriptTests(unittest.TestCase):
 
     def test_scripts_are_valid_bash(self) -> None:
         """A shell syntax regression must fail before an installer can mutate a host."""
-        for script in (INSTALLER, CHECKER):
+        for script in (INSTALLER, CHECKER, SKILL_INSTALLER):
             result = self.run_command("bash", "-n", str(script))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_skill_installer_creates_all_links_and_is_idempotent(self) -> None:
+        """A rerun must preserve the exact links that registered the three skills."""
+        with tempfile.TemporaryDirectory() as temporary:
+            skills_home = Path(temporary) / "skills"
+            environment = {"CTF_SKILLS_HOME": str(skills_home)}
+            first = self.run_command("bash", str(SKILL_INSTALLER), env=environment)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            first_report = json.loads(first.stdout)
+            self.assertEqual(first_report["source"], str(ROOT))
+            self.assertEqual(first_report["destination"], str(skills_home))
+            before: dict[str, tuple[int, str]] = {}
+            for name in ("pwn-agent", "web-agent", "rev-agent"):
+                link = skills_home / name
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.resolve(), (ROOT / name).resolve())
+                self.assertTrue((link / "SKILL.md").is_file())
+                self.assertEqual(first_report["skills"][name]["status"], "installed")
+                before[name] = (link.lstat().st_ino, os.readlink(link))
+
+            second = self.run_command("bash", str(SKILL_INSTALLER), env=environment)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            second_report = json.loads(second.stdout)
+            for name in ("pwn-agent", "web-agent", "rev-agent"):
+                link = skills_home / name
+                self.assertEqual((link.lstat().st_ino, os.readlink(link)), before[name])
+                self.assertEqual(second_report["skills"][name]["status"], "unchanged")
+
+    def test_skill_installer_refuses_unrelated_collisions_without_replacement(self) -> None:
+        """A user-owned path or unrelated symlink must survive registration unchanged."""
+        for collision_kind in ("file", "directory", "symlink"):
+            with self.subTest(collision_kind=collision_kind), tempfile.TemporaryDirectory() as temporary:
+                temporary_path = Path(temporary)
+                skills_home = temporary_path / "skills"
+                skills_home.mkdir()
+                collision = skills_home / "web-agent"
+                if collision_kind == "file":
+                    collision.write_text("user-owned\n", encoding="utf-8")
+                elif collision_kind == "directory":
+                    collision.mkdir()
+                    (collision / "keep.txt").write_text("user-owned\n", encoding="utf-8")
+                else:
+                    unrelated = temporary_path / "unrelated"
+                    unrelated.mkdir()
+                    collision.symlink_to(unrelated)
+                before_inode = collision.lstat().st_ino
+                before_link = os.readlink(collision) if collision.is_symlink() else None
+
+                result = self.run_command(
+                    "bash", str(SKILL_INSTALLER),
+                    env={"CTF_SKILLS_HOME": str(skills_home)},
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("refusing to replace", result.stderr)
+                self.assertEqual(collision.lstat().st_ino, before_inode)
+                if before_link is not None:
+                    self.assertEqual(os.readlink(collision), before_link)
+                elif collision_kind == "file":
+                    self.assertEqual(collision.read_text(encoding="utf-8"), "user-owned\n")
+                else:
+                    self.assertEqual((collision / "keep.txt").read_text(encoding="utf-8"), "user-owned\n")
 
     def test_installer_dry_run_is_non_mutating_plan(self) -> None:
         """The dry run catches an installer that attempts package installation immediately."""
@@ -101,15 +164,20 @@ class ToolScriptTests(unittest.TestCase):
 
     def test_checker_emits_one_json_capability_document(self) -> None:
         """The checker must be machine-readable even when capabilities are absent."""
-        result = self.run_command("bash", str(CHECKER))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        report = json.loads(result.stdout)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = self.run_command(
+                "bash", str(CHECKER),
+                env={"CTF_SKILLS_HOME": str(Path(temporary) / "missing-skills")},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
         self.assertEqual(report["schema_version"], 1)
         self.assertIn("venv", report)
         self.assertIn("cli", report)
         self.assertIn("python", report)
         self.assertIn("mcp", report)
         self.assertIn("browser", report)
+        self.assertIn("skills", report)
         for name in REQUIRED_CLIS:
             self.assert_capability(report["cli"][name])
         for name in REQUIRED_MODULES:
@@ -117,6 +185,25 @@ class ToolScriptTests(unittest.TestCase):
         for name in ("gdb", "idalib"):
             self.assert_capability(report["mcp"][name])
         self.assert_capability(report["browser"]["chrome"])
+        for name in ("pwn-agent", "web-agent", "rev-agent"):
+            self.assert_capability(report["skills"][name])
+            self.assertEqual(report["skills"][name]["status"], "degraded")
+        self.assertEqual(report["skill_summary"], {"available": 0, "degraded": 3})
+
+    def test_checker_reports_registered_skills_as_available(self) -> None:
+        """Only resolved skill links with regular SKILL.md files are available."""
+        with tempfile.TemporaryDirectory() as temporary:
+            skills_home = Path(temporary) / "skills"
+            skills_home.mkdir()
+            for name in ("pwn-agent", "web-agent", "rev-agent"):
+                (skills_home / name).symlink_to(ROOT / name)
+
+            report = self.checker_report({"CTF_SKILLS_HOME": str(skills_home)})
+
+        for name in ("pwn-agent", "web-agent", "rev-agent"):
+            self.assertEqual(report["skills"][name]["status"], "available")
+            self.assertEqual(report["skills"][name]["path"], str((ROOT / name).resolve()))
+        self.assertEqual(report["skill_summary"], {"available": 3, "degraded": 0})
 
     def test_checker_rejects_failed_and_unrelated_cli_probes(self) -> None:
         """A PATH entry is not a capability when its probe fails or identifies another tool."""

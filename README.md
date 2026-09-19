@@ -1,83 +1,59 @@
 # ctf_agent
 
-Codex skills and deterministic helpers for authorized CTF pwn, web, and
-reversing challenges on this Ubuntu notebook.
+Codex skills for authorized CTF pwn, web, and reversing challenges.
 
-## Layout
+## Quick start
 
-Place source artifacts under the exact event layout; challenge inputs stay
-read-only:
-
-```text
-/home/normalone/CTF/<event>/challenges/<challenge>/
-```
-
-Each initialization creates a separate run under:
-
-```text
-/home/normalone/CTF/<event>/runs/<category>/<slug>-<fingerprint12>/
-├── shared/findings/<session-id>/       # immutable, evidence-backed facts
-└── sessions/<session-id>/              # private state, logs, artifacts, profiles
-```
-
-Sessions never share mutable state. A later session may read matching immutable
-findings, but it must not treat old hypotheses as facts.
-
-## Install and check capabilities
-
-From this repository on Ubuntu, bootstrap the fixed managed Python environment
-and native tooling:
+From this repository, put each challenge in a flat directory under
+`/home/normalone/CTF`, register the skills, enable the managed tools for the
+current shell, and start Codex:
 
 ```bash
-bash tools/install-ctf-tools.sh
-bash tools/check-ctf-tools.sh
-```
-
-The installer creates `/home/normalone/CTF/.venv` with uv-managed Python 3.12,
-plus Python analysis/browser packages and available native tools. It does not
-alter existing `gdb` or `idalib` MCP configuration. Preview the commands
-without changing the host with `bash tools/install-ctf-tools.sh --dry-run`.
-
-The checker always writes one JSON capability document. A `degraded` item has a
-specific reason and a safe fallback, so unavailable optional scanners or
-accelerators do not become silent failures.
-
-The installer keeps its pinned user-scoped entries (ffuf, ProjectDiscovery
-httpx, gobuster, nuclei, sqlmap, and radare2) under the dedicated CTF manager
-directory, without modifying shell profiles or `~/.local/bin`. Enable those
-entries and the manager-local radare2 libraries for one shell after installation:
-
-```bash
+mkdir -p /home/normalone/CTF/babypwn
+cp ~/Downloads/chall /home/normalone/CTF/babypwn/
+bash tools/install-ctf-skills.sh
 source /home/normalone/CTF/.tools/env.sh
+codex -C /home/normalone/CTF
 ```
 
-## Use the skills
+Run `/skills` in Codex to confirm that `pwn-agent`, `web-agent`, and
+`rev-agent` were discovered. If they do not appear immediately, start a fresh
+Codex session after running the installer.
 
-Install `pwn-agent`, `web-agent`, `rev-agent`, and `ctf-common` as sibling
-Codex skills/support directories, then give Codex the authorized artifact or
-manifest-scoped endpoint. Typical prompts are:
+Paste the real event listing directly into the prompt. You never need to write
+YAML. For example:
 
 ```text
-Use $pwn-agent to solve this authorized pwn challenge and return a verified flag.
-Use $web-agent to solve this authorized web challenge and return a verified flag.
-Use $rev-agent to solve this authorized reversing challenge and return a verified flag.
+$pwn-agent The event listing says: "Our baby note service is finally ready for
+production. Can you read the flag? Connect with nc pwn.example.ctf 31337."
+The supplied binary is /home/normalone/CTF/babypwn/chall. Solve this authorized
+challenge and return a verified flag with evidence.
 ```
 
-The default `race` mode reports the first source-attributable, non-echoed flag
-with its evidence. Set `mode: strict` in `challenge.yaml` only when two fresh
-clean reproductions are required. Agents record evidence in their own session
-and publish reusable facts solely through immutable `shared/findings/` files.
+```text
+$rev-agent The event listing says: "The license checker accepts exactly one
+secret activation key. Find it." The supplied program is
+/home/normalone/CTF/keycheck/keycheck. Solve this authorized reversing
+challenge and return a verified flag with evidence.
+```
 
-## Test
+A black-box web challenge does not need a downloaded artifact. Create an empty
+problem directory, then paste the listing prose and its authorized endpoint:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tests.test_tool_scripts -v
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+mkdir -p /home/normalone/CTF/login-portal
 ```
 
-## Safety
+```text
+$web-agent The event listing says: "We replaced passwords with a simpler login
+flow. Can you reach the admin flag?" The authorized challenge endpoint is
+https://login.example.ctf/. Use /home/normalone/CTF/login-portal as the empty
+challenge directory, solve it, and return a verified flag with evidence.
+```
+
+The skills keep supplied inputs unchanged. Generated state, transcripts, and
+evidence go under the sibling `/home/normalone/CTF/runs/` directory, not inside
+the problem directory.
 
 Use these skills only with user-supplied challenge artifacts and explicitly
-authorized CTF endpoints. They must not scan targets outside the resolved
-manifest scope. Challenge binaries, flags, transcripts, debugger databases,
-and session workspaces are intentionally not included in this repository.
+authorized CTF endpoints.

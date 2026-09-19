@@ -6,7 +6,8 @@ set -euo pipefail
 CTF_ROOT=${CTF_TOOLS_ROOT:-/home/normalone/CTF}
 VENV=${CTF_TOOLS_VENV:-"$CTF_ROOT/.venv"}
 MANAGED_ROOT=${CTF_TOOLS_MANAGED_ROOT:-"$CTF_ROOT/.tools"}
-export CTF_ROOT VENV MANAGED_ROOT
+SKILLS_HOME=${CTF_SKILLS_HOME:-"$HOME/.agents/skills"}
+export CTF_ROOT VENV MANAGED_ROOT SKILLS_HOME
 CHECKER_PYTHON=${CTF_TOOLS_CHECKER_PYTHON:-python3}
 
 exec "$CHECKER_PYTHON" - <<'PY'
@@ -23,6 +24,7 @@ VENV = Path(os.environ["VENV"])
 VENV_PYTHON = VENV / "bin" / "python"
 MANAGED_BIN = Path(os.environ["MANAGED_ROOT"]) / "bin"
 MANAGED_LIB = Path(os.environ["MANAGED_ROOT"]) / "lib"
+SKILLS_HOME = Path(os.environ["SKILLS_HOME"])
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 BAD_OUTPUT = re.compile(r"(?:traceback|\busage:|\berror:|\bexception\b)", re.IGNORECASE)
 FALLBACKS = {
@@ -165,11 +167,26 @@ def chrome():
                     version, error = run_probe([str(candidate), "--version"], r"(?:Google Chrome|Chromium)\s+\d+\.\d+")
                     if not error: return available(str(candidate), version)
     return degraded("no successfully probed system Chrome/Chromium or Playwright browser executable was found", FALLBACKS["chrome"])
+def skill(name):
+    link = SKILLS_HOME / name
+    if not link.is_symlink():
+        return degraded(f"skill link is missing: {link}", "Run bash tools/install-ctf-skills.sh to register the repository skills.", str(link))
+    try:
+        target = link.resolve(strict=True)
+    except OSError as error:
+        return degraded(f"skill link cannot be resolved: {link}: {error}", "Run bash tools/install-ctf-skills.sh after removing the stale link.", str(link))
+    if not target.is_dir():
+        return degraded(f"skill link does not resolve to a directory: {link}", "Run bash tools/install-ctf-skills.sh after removing the stale link.", str(target))
+    skill_file = target / "SKILL.md"
+    if not skill_file.is_file():
+        return degraded(f"skill target has no regular SKILL.md: {target}", "Restore the repository skill or register a complete checkout.", str(target))
+    return available(str(target), None)
 
 venv_version, venv_error = run_probe([str(VENV_PYTHON), "--version"], r"^Python 3\.12\.\d+") if VENV_PYTHON.is_file() else (None, "managed Python executable is missing")
 venv = available(str(VENV_PYTHON), venv_version) if not venv_error else degraded(f"managed environment is unusable: {venv_error}", "Run bash tools/install-ctf-tools.sh to create the uv-managed Python 3.12 environment.", str(VENV_PYTHON))
-report = {"schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(), "venv": venv, "cli": {name: cli(name) for name in CLI_SPECS}, "python": {name: module(name, distribution, fallback) for name, (distribution, fallback) in MODULES.items()}, "mcp": {name: mcp(name) for name in ("gdb", "idalib")}, "browser": {"chrome": chrome()}}
+report = {"schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(), "venv": venv, "cli": {name: cli(name) for name in CLI_SPECS}, "python": {name: module(name, distribution, fallback) for name, (distribution, fallback) in MODULES.items()}, "mcp": {name: mcp(name) for name in ("gdb", "idalib")}, "browser": {"chrome": chrome()}, "skills": {name: skill(name) for name in ("pwn-agent", "web-agent", "rev-agent")}}
 capabilities = [report["venv"], *report["cli"].values(), *report["python"].values(), *report["mcp"].values(), *report["browser"].values()]
 report["summary"] = {"available": sum(item["status"] == "available" for item in capabilities), "degraded": sum(item["status"] == "degraded" for item in capabilities)}
+report["skill_summary"] = {"available": sum(item["status"] == "available" for item in report["skills"].values()), "degraded": sum(item["status"] == "degraded" for item in report["skills"].values())}
 print(json.dumps(report, sort_keys=True, indent=2))
 PY
