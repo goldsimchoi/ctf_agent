@@ -11,10 +11,11 @@ not a flag result.
 
 ## Start
 
-1. Identify the one dedicated problem folder from the request. It may have no
-   `challenge.yaml`; no YAML, labels such as `description:` or `address:`, or fixed
-   problem-statement layout is required. Never treat `/home/normalone/CTF` itself
-   or a folder containing multiple problems as the challenge directory.
+1. Identify the one dedicated problem folder below `/home/normalone/CTF` from the
+   request. It may have no `challenge.yaml`; no YAML, labels such as `description:`
+   or `address:`, or fixed problem-statement layout is required. Never treat
+   `/home/normalone/CTF` itself or a folder containing multiple problems as the
+   challenge directory.
 2. Preserve the entire pasted event statement exactly. Interpret its natural-language
    meaning and recognize TCP candidates written as `nc host port`, `host:port`, or
    `tcp://host:port`. Select exactly one clear candidate without connecting to any
@@ -28,13 +29,12 @@ not a flag result.
 
    ```text
    python3 <skill>/scripts/init_run.py <challenge-dir> \
-     --event-root <event-root> --request-json -
+     --event-root /home/normalone/CTF --request-json -
    ```
 
-   Use `/home/normalone/CTF` as `<event-root>` whenever the challenge is below that
-   root. Otherwise use the containing event root. The stdin object has `statement`
-   set to the exact full prose and includes `target`, `binary`, and `flag_pattern`
-   only when selected. For example, its data shape is:
+   The stdin object has `statement` set to the exact full prose and includes
+   `target`, `binary`, and `flag_pattern` only when selected. For example, its data
+   shape is:
 
    ```json
    {

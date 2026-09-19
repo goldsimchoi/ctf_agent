@@ -8,6 +8,15 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = ROOT / "pwn-agent"
 
 class PwnAgentLayoutTests(unittest.TestCase):
+    def test_intake_instructions_require_the_fixed_ctf_event_root(self) -> None:
+        for relative in ("SKILL.md", "references/workflow.md"):
+            with self.subTest(relative=relative):
+                instructions = (SKILL_DIR / relative).read_text(encoding="utf-8")
+
+                self.assertIn("--event-root /home/normalone/CTF", instructions)
+                self.assertNotIn("--event-root <event-root>", instructions)
+                self.assertNotIn("otherwise pass its containing event root", instructions.lower())
+
     def test_notebook_mcp_names_are_declared_in_metadata(self) -> None:
         metadata = yaml.safe_load(
             (SKILL_DIR / "agents" / "openai.yaml").read_text(encoding="utf-8")

@@ -2,21 +2,20 @@
 
 The Lead Solver owns the canonical exploit and final decision.
 
-1. Identify one dedicated challenge directory and retain the complete pasted event
-   statement. Extract TCP candidates only from supplied context in `nc host port`,
-   `host:port`, or `tcp://host:port` form; never connect to candidates to choose one.
-   Missing TCP context means local-only. Ask one precise question when multiple
-   plausible tuples remain.
+1. Identify one dedicated challenge directory below `/home/normalone/CTF` and retain
+   the complete pasted event statement. Extract TCP candidates only from supplied
+   context in `nc host port`, `host:port`, or `tcp://host:port` form; never connect
+   to candidates to choose one. Missing TCP context means local-only. Ask one precise
+   question when multiple plausible tuples remain.
 2. Inspect supplied files read-only by type/magic and select one clear
    challenge-relative ELF, PE, or script as `binary`. Ask one precise question when
    multiple executable candidates remain; do not run them to decide.
 3. Initialize by passing the exact statement and selected `target`, `binary`, and
    optional `flag_pattern` as one JSON object over stdin to
    `init_run.py --request-json -`. Free-form prose must never appear in shell argv.
-   No YAML or labeled fields are required, and challenge inputs remain unchanged. For every
-   challenge below `/home/normalone/CTF`, pass
-   `--event-root /home/normalone/CTF`; otherwise pass its containing event root.
-   Read returned immutable findings before solve triage.
+   No YAML or labeled fields are required, and challenge inputs remain unchanged.
+   Always pass `--event-root /home/normalone/CTF`. Read returned immutable findings
+   before solve triage.
 4. Triage file type, architecture, mitigations, imports, strings, protocol,
    supplied libc/loader, and one normal execution.
 5. Create a small runnable `exploit.py`; make each unknown a hypothesis with one
