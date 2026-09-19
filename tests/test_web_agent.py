@@ -25,8 +25,10 @@ COMMON_SCRIPTS = REPO_ROOT / "ctf-common" / "scripts"
 REQUEST = SKILL_DIR / "assets" / "request.py"
 VERIFY_WEB_FLAG = SKILL_DIR / "scripts" / "verify_web_flag.py"
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
+sys.path.insert(0, str(COMMON_SCRIPTS))
 from web_provenance import prepared_sent_evidence, sent_history  # noqa: E402
-from ctf_workspace import MAX_ARTIFACT_BYTES  # noqa: E402
+from ctf_intake import IntakeRequest  # noqa: E402
+from ctf_workspace import MAX_ARTIFACT_BYTES, create_session  # noqa: E402
 GZIP_BODY = gzip.compress(b"FLAG{compressed_target_result}", mtime=0)
 READY_EXEC = """
 import os
@@ -92,7 +94,13 @@ def wait_for_ready(process: subprocess.Popen[str], ready: Path, timeout: float) 
 class TargetHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.server.hits += 1
-        if self.path == "/gzip":
+        if self.path == "/entry?x=1":
+            body = b"FLAG{fileless_black_box}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/gzip":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Encoding", "gzip")
@@ -340,6 +348,23 @@ def local_server(handler: type[http.server.BaseHTTPRequestHandler]):
 
 
 class WebAgentTests(unittest.TestCase):
+    def make_intake_workspace(
+        self,
+        root: Path,
+        target: str | None,
+        *,
+        statement: str = "Solve the black-box web challenge and return FLAG{...}.",
+    ) -> tuple[dict, Path]:
+        challenge = root / "event" / "challenges" / "portal"
+        challenge.mkdir(parents=True, exist_ok=True)
+        row = create_session(
+            challenge,
+            "web",
+            event_root=root / "event",
+            intake=IntakeRequest(statement=statement, target=target),
+        )
+        return row, challenge
+
     def make_workspace(
         self, root: Path, session_id: str, origin: str | None = None, category: str = "web"
     ) -> Path:
@@ -396,6 +421,65 @@ class WebAgentTests(unittest.TestCase):
         self.assertTrue(metadata["policy"]["allow_implicit_invocation"])
         self.assertIn("https://h4c.team/posts/74", metadata["sources"])
         self.assertEqual(challenge["category"], "web")
+
+    def test_fileless_black_box_intake_is_isolated(self) -> None:
+        with (
+            local_server(TargetHandler) as (first_server, first_origin),
+            local_server(TargetHandler) as (second_server, second_origin),
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            first_server.external_url = first_origin
+            second_server.external_url = second_origin
+            root = Path(temp)
+            statement = """Open the live challenge and recover the flag.
+The event prose may contain `code`, $(shell-looking text), and \"quotes\"."""
+            first_row, challenge = self.make_intake_workspace(
+                root, first_origin + "/entry?x=1", statement=statement
+            )
+
+            self.assertEqual(list(challenge.iterdir()), [])
+            request_record = json.loads(
+                Path(first_row["intake"]["request_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(request_record["statement"], statement)
+            self.assertEqual(request_record["normalized"]["start_url"], first_origin + "/entry?x=1")
+            state = self.init_web_state(first_row["workspace"])
+            captured = self.request(
+                first_row["workspace"],
+                request_record["normalized"]["start_url"],
+                "--progress",
+                "new fact: entry returned a candidate",
+            )
+
+            self.assertEqual(captured.returncode, 0, captured.stderr)
+            evidence = json.loads(captured.stdout)
+            session = Path(first_row["workspace"])
+            provenance = json.loads(Path(evidence["provenance"]).read_text(encoding="utf-8"))
+            captured_paths = {
+                key: evidence[key]
+                for key in ("prepared_request", "response_entity_body", "provenance", "attestation")
+            }
+            captured_paths.update(
+                {f"capture_{key}": provenance["capture"][key] for key in ("output", "sent")}
+            )
+            for key, value in captured_paths.items():
+                path = Path(value).resolve()
+                self.assertTrue(path.is_file(), key)
+                self.assertTrue(path.is_relative_to(session.resolve()), key)
+            for key in ("requests_dir", "responses_dir", "provenance_dir", "captures_dir"):
+                self.assertTrue(Path(state[key]).resolve().is_relative_to(session.resolve()), key)
+            self.assertEqual(list(challenge.iterdir()), [])
+            verified = self.verify(session, "--output", evidence["response_entity_body"])
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+            self.assertEqual(json.loads(verified.stdout)["flag"], "FLAG{fileless_black_box}")
+
+            second_row, _ = self.make_intake_workspace(
+                root, second_origin + "/entry?x=1", statement=statement
+            )
+            self.assertNotEqual(
+                Path(first_row["workspace"]).parents[1],
+                Path(second_row["workspace"]).parents[1],
+            )
 
     def test_sessions_do_not_share_browser_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -889,6 +973,57 @@ class WebAgentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(server.hits, 1)
             self.assertEqual(outside.hits, 0)
+
+    def test_generated_intake_manifest_enforces_exact_origin(self) -> None:
+        with (
+            local_server(TargetHandler) as (server, origin),
+            local_server(CountHandler) as (outside, outside_origin),
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            server.external_url = outside_origin
+            row, _ = self.make_intake_workspace(Path(temp), origin + "/entry?x=1")
+            workspace = row["workspace"]
+            self.init_web_state(workspace)
+
+            rejected_urls = (
+                origin.replace("http://", "https://", 1) + "/gzip",
+                origin.replace("127.0.0.1", "localhost", 1) + "/gzip",
+                outside_origin + "/outside",
+            )
+            for url in rejected_urls:
+                with self.subTest(url=url):
+                    rejected = self.request(workspace, url)
+                    self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
+            self.assertEqual(server.hits, 0)
+            self.assertEqual(outside.hits, 0)
+
+            same_origin = self.request(
+                workspace, origin + "/gzip", "--progress", "new fact: same-origin path works"
+            )
+            self.assertEqual(same_origin.returncode, 0, same_origin.stdout + same_origin.stderr)
+            self.assertEqual(server.hits, 1)
+
+            redirected = self.request(
+                workspace,
+                origin + "/external-redirect",
+                "--progress",
+                "new fact: external redirect rejected",
+            )
+            self.assertEqual(redirected.returncode, 2, redirected.stdout + redirected.stderr)
+            self.assertEqual(server.hits, 2)
+            self.assertEqual(outside.hits, 0)
+
+    def test_generated_intake_without_target_needs_selection_before_traffic(self) -> None:
+        with local_server(CountHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            row, challenge = self.make_intake_workspace(Path(temp), None)
+
+            self.assertEqual(list(challenge.iterdir()), [])
+            self.assertEqual(row["intake"]["target_status"], "needs_selection")
+            self.init_web_state(row["workspace"])
+            rejected = self.request(row["workspace"], origin + "/unselected")
+
+            self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
+            self.assertEqual(server.hits, 0)
 
     def test_web_verifier_requires_recorded_provenance_for_race_and_strict(self) -> None:
         with local_server(TargetHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:

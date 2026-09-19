@@ -11,22 +11,46 @@ adapts the coverage-ledger and state-discipline lessons from TeamH4C's
 
 ## Start
 
-1. Read [references/safety.md](references/safety.md). Accept live traffic only
-   when the resolved manifest says `authorized: true`,
-   `network_access: agent_allowed`, and supplies one exact `origin`.
-2. Initialize the common workspace, then browser/request state:
+1. Identify one dedicated challenge directory below `/home/normalone/CTF` from
+   the user's current request. The directory may be empty and does not need a
+   `challenge.yaml` or any fixed problem-statement layout. Never use
+   `/home/normalone/CTF` itself or a directory containing multiple challenges.
+2. Preserve the entire pasted event statement exactly. From the current request,
+   select exactly one clear live challenge URL using HTTP or HTTPS without
+   connecting to candidates, and normalize that one selection while preserving
+   its path and query. Do not select an event page, documentation URL, or other
+   contextual link that is not the live challenge. If two origins remain
+   plausible, ask one precise question rather than probing either. A request with
+   no clear live target remains `needs_selection` and permits no traffic.
+3. Read [references/safety.md](references/safety.md), then send one JSON object as
+   standard input, never as shell arguments, to:
 
    ```text
-   python3 <ctf-common>/scripts/init_session.py <challenge-dir> --category web --event-root <event-root>
+   python3 <ctf-common>/scripts/init_session.py <challenge-dir> \
+     --category web --event-root /home/normalone/CTF --request-json -
+   ```
+
+   Set `statement` to the exact full prose and include the normalized URL as
+   `target`; include `flag_pattern` only when supplied. Pass the JSON bytes with a
+   process API. Never interpolate, quote, or otherwise place statement prose in a
+   shell command, and never add YAML to the challenge input directory. The
+   initializer normalizes the target into `start_url` and one exact `origin`.
+4. Accept live traffic only when the generated resolved manifest says
+   `authorized: true`, `network_access: agent_allowed`, and supplies that exact
+   `origin`. Initialize browser/request state in the returned workspace:
+
+   ```text
    python3 <skill>/scripts/init_web_state.py --workspace <workspace>
    ```
 
-   Keep inputs read-only. The returned session owns `web/cookies.json`,
-  `web/browser-profile/`, `web/requests/`, `web/responses/`, and response
-  provenance, capture scans, bounded sent history, plus the coverage ledger and
-  capabilities. Never share a cookie jar or browser profile.
-3. Read existing immutable findings before one cheap triage pass. Reuse only
-   evidence-backed facts from the matching fingerprint.
+   Begin the first request at the generated `start_url`. Every later HTTP,
+   browser, or WebSocket interaction must remain at the generated manifest
+   `origin`. Keep challenge inputs read-only. The session owns
+   `web/cookies.json`, `web/browser-profile/`, `web/requests/`,
+   `web/responses/`, response provenance, capture scans, bounded sent history,
+   the coverage ledger, and capabilities. Never share a cookie jar or profile.
+5. Read existing immutable findings before one cheap triage pass. Reuse only
+   evidence-backed facts from the matching combined fingerprint.
 
 ## Solve
 

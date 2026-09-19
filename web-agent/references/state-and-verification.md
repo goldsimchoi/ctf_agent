@@ -1,5 +1,14 @@
 # Web state and verification
 
+The common initializer accepts an empty dedicated challenge directory below
+`/home/normalone/CTF`. With `--event-root /home/normalone/CTF --request-json -`,
+it preserves the full statement in `challenge-request.json` and emits only
+validated adapter fields to `challenge.resolved.yaml`. A selected web target
+produces `start_url`, exact `origin`, `authorized: true`, and
+`network_access: agent_allowed`; `start_url` is the first request and `origin` is
+the boundary for every subsequent request and redirect. Without a selected target,
+`intake.target_status` is `needs_selection` and no web traffic is allowed.
+
 `init_web_state.py` creates `web/cookies.json`, `web/browser-profile/`,
 `web/coverage.json`, `web/capabilities.json`, `web/requests/`, `web/responses/`,
 and `web/provenance/` inside one common web workspace. These paths are session-owned;
