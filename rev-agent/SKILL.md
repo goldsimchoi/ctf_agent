@@ -11,20 +11,50 @@ the target binary is the oracle.
 
 ## Start
 
-1. Read [references/safety.md](references/safety.md). Accept only user-supplied
-   local artifacts and manifest-authorized CTF execution. Keep challenge inputs
-   read-only.
-2. Create the common session and session-local reversing state:
+1. Identify the one dedicated problem folder below `/home/normalone/CTF` from
+   the request. It may have no `challenge.yaml`; no YAML, labels, or fixed
+   problem-statement layout is required. Never treat `/home/normalone/CTF`
+   itself or a folder containing multiple problems as the challenge directory.
+2. Preserve the entire pasted event statement exactly. Read
+   [references/safety.md](references/safety.md), then inspect supplied files
+   without executing them: use cheap, read-only magic, format, and permission
+   checks to identify one clear challenge-relative executable. If multiple
+   executables are equally plausible, ask one precise question instead of
+   guessing. Reversing intake is local-only; do not select, probe, or use a
+   network target.
+3. Send one normalized JSON object as standard input, never as shell arguments,
+   to the common initializer:
 
    ```text
    python3 <ctf-common>/scripts/init_session.py <challenge-dir> --category rev \
-     --event-root <event-root>
+     --event-root /home/normalone/CTF --request-json -
+   ```
+
+   The stdin object has `statement` set to the exact full prose and includes
+   `binary` and `flag_pattern` only when selected. For example:
+
+   ```json
+   {
+     "statement": "<entire exact pasted event statement>",
+     "binary": "chall",
+     "flag_pattern": "H4C\\{[^}\\r\\n]+\\}"
+   }
+   ```
+
+   Pass those JSON bytes through stdin using a process API; never interpolate,
+   quote, or otherwise place free-form prose in a shell command. Do not add YAML
+   to the challenge directory. If no executable is clear, omit `binary`, stop
+   at returned `target_status: needs_selection`, and ask the precise selection
+   question; do not run an oracle.
+4. Initialize session-local reversing state:
+
+   ```text
    python3 <skill>/scripts/init_rev_state.py --workspace <workspace>
    ```
 
    Work only in the returned `runs/rev/` session. Read returned immutable
    findings before analysis; never promote an old hypothesis to fact.
-3. Read [references/runtime.md](references/runtime.md),
+5. Read [references/runtime.md](references/runtime.md),
    [references/workflow.md](references/workflow.md), and
    [references/state-and-verification.md](references/state-and-verification.md).
 

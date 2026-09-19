@@ -15,7 +15,14 @@ the next change so both ledgers recover together after interruption.
 Recovery validates both complete ledgers and their bidirectional links before
 writing either one; an invalid journal is retained and reported for forensics.
 
-Use only the `authorized: true` challenge-relative `binary` in
+The common initializer receives the exact pasted statement, selected
+challenge-relative `binary`, and optional `flag_pattern` as stdin JSON and emits
+`challenge.resolved.yaml`; free-form prose never needs YAML or shell arguments.
+A result of `target_status: needs_selection` authorizes no oracle run. Ask one
+precise question, and do not guess or bind an archive-derived executable from
+inside session artifacts. Reversing sessions never authorize a network target.
+
+Use only the `authorized: true` challenge-relative `binary` in the generated
 `challenge.resolved.yaml` as the oracle. The solver binds `--binary` to that
 regular, non-symlink file, preserves exact sent and raw combined stdout/stderr
 bytes as new files in `rev/oracle/`, and publishes an immutable capture

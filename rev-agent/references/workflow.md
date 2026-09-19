@@ -1,26 +1,42 @@
 # Clue-driven reversing workflow
 
-1. Initialize one common `rev` session, then run `init_rev_state.py`. Read valid
-   immutable shared findings before a single cheap triage pass: file metadata,
-   architecture, imports, strings, constants, entry points, and one controlled
-   execution.
-2. Add only high-value observations to `clues.json`: each clue needs evidence,
+1. Identify one dedicated challenge directory below `/home/normalone/CTF` and
+   retain the complete pasted event statement. Before initialization, inspect
+   supplied files only with cheap read-only magic, format, and permission checks.
+   Select one clear challenge-relative executable without running it. If several
+   candidates remain plausible, ask one precise question instead of guessing.
+2. Initialize one common `rev` session by sending a single stdin JSON object to:
+
+   ```text
+   python3 <ctf-common>/scripts/init_session.py <challenge-dir> --category rev \
+     --event-root /home/normalone/CTF --request-json -
+   ```
+
+   Set `statement` to the exact pasted prose and include the selected `binary`
+   and optional `flag_pattern`; never put prose in command-line arguments and
+   never add YAML. Reversing intake accepts no network target. If the result is
+   `target_status: needs_selection`, stop before oracle execution.
+3. Run `init_rev_state.py`, then read valid immutable shared findings before a
+   single cheap triage pass: file metadata, architecture, imports, strings,
+   constants, entry points, and one controlled execution of only the bound
+   executable.
+4. Add only high-value observations to `clues.json`: each clue needs evidence,
    relevant xrefs and functions, and the cheapest next action that could
    discriminate it. Do not summarize the whole binary.
-3. Use `idalib` call graphs, xrefs, and data flow to join user input through each
+5. Use `idalib` call graphs, xrefs, and data flow to join user input through each
    transformation to the final comparison. Follow actual calls and global data,
    not a plausible function name. Treat decompiler/algorithm claims as active
    hypotheses until assembly or runtime evidence supports them.
-4. Give every hypothesis an explicit falsifying test. Record each test and its
+6. Give every hypothesis an explicit falsifying test. Record each test and its
    evidence in `hypotheses.json`; record conflicting evidence in
    `contradictions.json`. Two experiments with no progress reject the hypothesis
    and require a materially different approach.
-5. Create a candidate input, solver, keygen, emulator, or patch early. Run it
+7. Create a candidate input, solver, keygen, emulator, or patch early. Run it
    against the manifest-authorized local binary as the oracle and save output in
    `rev/oracle/`. The solver creates sent/output evidence and an attestation in
    the same capture; do not verify arbitrary files.
    Identifying an algorithm in prose is not completion.
-6. Before meaningful target interaction, call the common attempt ledger. After
+8. Before meaningful target interaction, call the common attempt ledger. After
    two no-progress attempts, change strategy; publish reusable verified facts
    only with the common finding CLI.
 

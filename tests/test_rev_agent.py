@@ -14,8 +14,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "rev-agent"
 COMMON_SCRIPTS = REPO_ROOT / "ctf-common" / "scripts"
 SCRIPTS = SKILL_DIR / "scripts"
+sys.path.insert(0, str(COMMON_SCRIPTS))
 sys.path.insert(0, str(SCRIPTS))
 
+from ctf_intake import IntakeRequest  # noqa: E402
+from ctf_workspace import create_session  # noqa: E402
 from init_rev_state import init_rev_state  # noqa: E402
 import record_clue as rev_state  # noqa: E402
 from record_clue import (  # noqa: E402
@@ -72,6 +75,95 @@ class RevAgentTests(unittest.TestCase):
         self.assertTrue(metadata["policy"]["allow_implicit_invocation"])
         self.assertIn("https://h4c.team/posts/49", metadata["sources"])
         self.assertEqual(challenge["category"], "rev")
+
+    def test_yaml_free_intake_binds_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            challenge = root / "event" / "challenges" / "serial-checker"
+            challenge.mkdir(parents=True)
+            target = challenge / "chall"
+            ran = challenge / "ran"
+            target.write_text(
+                "#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\n"
+                f"Path({str(ran)!r}).write_text('ran', encoding='utf-8')\n"
+                "sys.stdout.buffer.write(b'H4C{generated-manifest}\\n')\n"
+                "sys.stdout.buffer.flush()\n"
+                "sys.stderr.buffer.write(b'raw-stderr\\xff')\n",
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+
+            row = create_session(
+                challenge,
+                "rev",
+                intake=IntakeRequest(
+                    statement="Find the correct serial and return H4C{...}",
+                    binary="chall",
+                    flag_pattern=r"H4C\{[^}\r\n]+\}",
+                ),
+            )
+            self.assertFalse((challenge / "challenge.yaml").exists())
+            self.assertEqual(row["intake"]["target_status"], "bound")
+            workspace = Path(row["workspace"])
+            request = json.loads(
+                (workspace / "challenge-request.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                request["statement"],
+                "Find the correct serial and return H4C{...}",
+            )
+            self.assertEqual(request["binary"], "chall")
+            self.assertIn(
+                "binary: chall",
+                (workspace / "challenge.resolved.yaml").read_text(encoding="utf-8"),
+            )
+            init_rev_state(workspace)
+
+            result = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace),
+                "--binary", str(target),
+                "--candidate", "correct-serial",
+                "--verify",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout)
+            payload = json.loads(result.stdout)
+            self.assertEqual(Path(payload["sent"]).read_bytes(), b"correct-serial\n")
+            self.assertEqual(
+                Path(payload["output"]).read_bytes(),
+                b"H4C{generated-manifest}\nraw-stderr\xff",
+            )
+            attestation = json.loads(
+                Path(payload["attestation"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(attestation["source_target"], f"local:{target}")
+            self.assertEqual(attestation["output"]["path"], payload["output"])
+            self.assertEqual(payload["verification"]["status"], "verified")
+
+            ran.unlink()
+            foreign = root / "foreign"
+            foreign.write_text(target.read_text(encoding="utf-8"), encoding="utf-8")
+            foreign.chmod(0o755)
+            rejected = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(workspace),
+                "--binary", str(foreign),
+                "--candidate", "must-not-run",
+            )
+            self.assertEqual(rejected.returncode, 2)
+            self.assertFalse(ran.exists())
+
+            no_binary = root / "event" / "challenges" / "needs-selection"
+            no_binary.mkdir()
+            pending = create_session(
+                no_binary,
+                "rev",
+                intake=IntakeRequest(statement="Find the correct serial"),
+            )
+            self.assertEqual(pending["intake"]["target_status"], "needs_selection")
+            pending_workspace = Path(pending["workspace"])
+            self.assertFalse((pending_workspace / "rev" / "oracle").exists())
 
     def test_init_creates_session_local_ida_gdb_and_oracle_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
