@@ -24,6 +24,7 @@ from ctf_intake import (
 
 CATEGORIES = {"pwn", "web", "rev"}
 MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
+MAX_MANIFEST_BYTES = 256 * 1024
 MAX_VERIFICATION_ARTIFACTS = 16
 MAX_VERIFICATION_BYTES = 8 * 1024 * 1024
 DEFAULT_PATTERNS = (
@@ -121,6 +122,8 @@ def new_session_id(category: str) -> str:
 
 def _resolve_directory(path: Path, description: str) -> Path:
     raw = path.expanduser().absolute()
+    if ".." in raw.parts:
+        raise InvalidInput(f"{description} path must not contain traversal components: {raw}")
     _reject_symlink_components(raw)
     if not raw.is_dir():
         raise InvalidInput(f"{description} is not a directory: {raw}")
@@ -267,6 +270,8 @@ def _create_session_directory(sessions: Path, identifier: str) -> Path:
 
 
 def _under(path: Path, root: Path) -> bool:
+    if ".." in path.parts or ".." in root.parts:
+        return False
     try:
         path.relative_to(root)
     except ValueError:
@@ -391,10 +396,20 @@ def _manifest_scalars(challenge: Path) -> dict[str, str]:
                     raise InvalidInput(
                         f"legacy manifest is not a regular file: {challenge / name}"
                     )
+                if metadata.st_size > MAX_MANIFEST_BYTES:
+                    raise InvalidInput(f"legacy manifest exceeds {MAX_MANIFEST_BYTES} bytes")
                 chunks: list[bytes] = []
-                while block := os.read(file_descriptor, 1024 * 1024):
+                total = 0
+                while block := os.read(
+                    file_descriptor, min(64 * 1024, MAX_MANIFEST_BYTES - total + 1)
+                ):
+                    total += len(block)
+                    if total > MAX_MANIFEST_BYTES:
+                        raise InvalidInput(f"legacy manifest exceeds {MAX_MANIFEST_BYTES} bytes")
                     chunks.append(block)
                 content = b"".join(chunks)
+            except OSError as exc:
+                raise InvalidInput(f"legacy manifest is unreadable: {challenge / name}") from exc
             finally:
                 os.close(file_descriptor)
             break
@@ -439,16 +454,54 @@ def _validate_selected_binary(challenge: Path, value: str) -> str:
 
 
 def challenge_fingerprint(challenge: Path) -> str:
-    """Hash the sorted relative names and bytes of immutable challenge inputs."""
-    digest = hashlib.sha256()
-    files = sorted(path for path in challenge.rglob("*") if path.is_file())
-    for path in files:
-        relative = path.relative_to(challenge).as_posix().encode("utf-8")
+    """Hash versioned name/content-digest records through no-follow descriptors."""
+    records: list[tuple[bytes, bytes]] = []
+
+    def visit(directory: int, prefix: Path) -> None:
+        for name in sorted(os.listdir(directory)):
+            relative = prefix / name
+            metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                child = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory,
+                )
+                try:
+                    visit(child, relative)
+                finally:
+                    os.close(child)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise InvalidInput(f"challenge artifact is not a regular file: {relative}")
+            descriptor = os.open(
+                name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory,
+            )
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise InvalidInput(f"challenge artifact is not a regular file: {relative}")
+                content = hashlib.sha256()
+                while block := os.read(descriptor, 1024 * 1024):
+                    content.update(block)
+                records.append((os.fsencode(relative.as_posix()), content.digest()))
+            finally:
+                os.close(descriptor)
+
+    descriptor: int | None = None
+    try:
+        descriptor = _open_directory_nofollow(challenge)
+        visit(descriptor, Path())
+    except OSError as exc:
+        raise InvalidInput(f"challenge artifact is unreadable: {challenge}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+    # Each record has one length-prefixed name and one fixed-width SHA-256.
+    digest = hashlib.sha256(b"ctf-challenge-fingerprint-v2\0")
+    for relative, content_digest in sorted(records):
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
-        with path.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(block)
+        digest.update(content_digest)
     return digest.hexdigest()
 
 

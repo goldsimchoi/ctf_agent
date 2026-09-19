@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import secrets
 import stat
 import subprocess
@@ -24,6 +23,7 @@ from ctf_workspace import (  # noqa: E402
     CollisionError,
     InvalidInput,
     _open_directory_nofollow,
+    _parse_manifest_scalars as _manifest_scalars,
     _read_regular_under,
     _safe_directory,
     _workspace_root,
@@ -41,18 +41,6 @@ def _under(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _manifest_scalars(data: bytes) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in data.decode("utf-8", errors="strict").splitlines():
-        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*(?:#.*)?$", line)
-        if match:
-            key, value = match.groups()
-            value = value.strip().strip("'\"")
-            if value and not value.startswith(("[", "{", "|", ">")):
-                values[key] = value
-    return values
 
 
 def _authorized_binary(workspace: Path, supplied: Path) -> tuple[Path, dict[str, Any], Path]:

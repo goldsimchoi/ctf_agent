@@ -1,13 +1,19 @@
+import importlib.util
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SKILL_DIR = REPO_ROOT / "pwn-agent"
+sys.path.insert(0, str(REPO_ROOT / "ctf-common" / "scripts"))
+
+from ctf_intake import MAX_REQUEST_BYTES  # noqa: E402
+from ctf_workspace import InvalidInput  # noqa: E402
 
 
 def run_script(
@@ -197,6 +203,7 @@ class PwnAgentScriptTests(unittest.TestCase):
 
             rejected_targets = (
                 "tcp://other.example:31337",
+                "tcp://pwn.example:31338",
                 f"local:{other_binary.resolve()}",
             )
             for index, source_target in enumerate(rejected_targets):
@@ -214,6 +221,77 @@ class PwnAgentScriptTests(unittest.TestCase):
                     str(sent),
                 )
                 self.assertEqual(rejected.returncode, 2)
+
+    def test_local_capture_requires_explicit_authorization(self) -> None:
+        for authorization in ('authorized: "false"\n', ""):
+            with self.subTest(authorization=authorization):
+                with tempfile.TemporaryDirectory() as temp:
+                    workspace = self.make_session(Path(temp))
+                    session = json.loads((workspace / "session.json").read_text())
+                    binary = Path(session["challenge"]) / "chall"
+                    (workspace / "challenge.resolved.yaml").write_text(
+                        authorization + "binary: chall\n", encoding="utf-8",
+                    )
+                    output = workspace / "transcripts" / "capture.output"
+                    sent = workspace / "transcripts" / "capture.sent"
+                    output.write_bytes(b"response")
+                    sent.write_bytes(b"input")
+                    before = sorted(path.relative_to(workspace) for path in workspace.rglob("*"))
+
+                    result = run_script(
+                        "publish_capture.py", "--workspace", str(workspace),
+                        "--capture-id", "unauthorized", "--source-target", f"local:{binary}",
+                        "--output", str(output), "--sent", str(sent),
+                    )
+
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertEqual(json.loads(result.stdout)["status"], "error")
+                    self.assertIn("authoriz", json.loads(result.stdout)["error"])
+                    self.assertEqual(
+                        sorted(path.relative_to(workspace) for path in workspace.rglob("*")), before,
+                    )
+
+    def test_local_capture_rejects_authorization_before_binary_read(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "pwn_capture_authorization_test", SKILL_DIR / "scripts" / "publish_capture.py",
+        )
+        capture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(capture)
+        for authorization in ({"authorized": "false"}, {}):
+            with self.subTest(authorization=authorization):
+                with patch.object(
+                    capture, "_read_regular_under",
+                    side_effect=AssertionError("unauthorized binary was read"),
+                ):
+                    with self.assertRaisesRegex(InvalidInput, "authoriz"):
+                        capture.bound_source_target(
+                            Path("/unused/workspace"), {"challenge": "/unused/challenge"},
+                            {"binary": "chall", **authorization}, "local:/unused/challenge/chall",
+                        )
+
+    def test_intake_capture_preserves_quoted_binary_identity(self) -> None:
+        for name in ("chall#one", 'chall"two', "chall\\three"):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp:
+                    challenge = Path(temp) / "challenge"
+                    challenge.mkdir()
+                    binary = challenge / name
+                    binary.write_bytes(b"fixture")
+                    initialized = run_script("init_run.py", str(challenge), "--binary", name)
+                    self.assertEqual(initialized.returncode, 0, initialized.stdout)
+                    workspace = Path(json.loads(initialized.stdout)["workspace"])
+                    output = workspace / "transcripts" / "capture.output"
+                    sent = workspace / "transcripts" / "capture.sent"
+                    output.write_bytes(b"response")
+                    sent.write_bytes(b"input")
+                    result = run_script(
+                        "publish_capture.py", "--workspace", str(workspace),
+                        "--capture-id", "quoted", "--source-target", f"local:{binary}",
+                        "--output", str(output), "--sent", str(sent),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    attestation = json.loads(Path(json.loads(result.stdout)["attestation"]).read_text())
+                    self.assertEqual(attestation["source_target"], f"local:{binary}")
 
     def test_init_run_forwards_individual_intake_fields_as_literal_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -271,7 +349,7 @@ class PwnAgentScriptTests(unittest.TestCase):
     def test_init_run_rejects_mixed_or_oversized_stdin_before_starting_child(self) -> None:
         cases = (
             (json.dumps({"statement": "valid"}), ("--statement", "mixed")),
-            ("x" * (1024 * 1024), ()),
+            ("x" * (MAX_REQUEST_BYTES + 1), ()),
         )
         for index, (stdin, extra) in enumerate(cases):
             with self.subTest(index=index):

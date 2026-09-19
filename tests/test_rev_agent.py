@@ -174,6 +174,40 @@ class RevAgentTests(unittest.TestCase):
             self.assertEqual(pending["intake"]["target_status"], "needs_selection")
             pending_workspace = Path(pending["workspace"])
             self.assertFalse((pending_workspace / "rev" / "oracle").exists())
+            before = sorted(path.relative_to(pending_workspace) for path in pending_workspace.rglob("*"))
+            rejected_pending = run_script(
+                SKILL_DIR / "assets" / "solver.py",
+                "--workspace", str(pending_workspace),
+                "--binary", str(foreign), "--candidate", "must-not-run",
+            )
+            self.assertEqual(rejected_pending.returncode, 2, rejected_pending.stdout)
+            self.assertEqual(json.loads(rejected_pending.stdout)["status"], "error")
+            self.assertFalse(ran.exists())
+            self.assertEqual(
+                sorted(path.relative_to(pending_workspace) for path in pending_workspace.rglob("*")), before,
+            )
+
+    def test_intake_oracle_preserves_quoted_binary_identity(self) -> None:
+        for name in ("chall#one", 'chall"two', "chall\\three"):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as temp:
+                    challenge = Path(temp) / "challenge"
+                    challenge.mkdir()
+                    target = challenge / name
+                    target.write_text("#!/bin/sh\nprintf 'captured\\n'\n", encoding="utf-8")
+                    target.chmod(0o755)
+                    row = create_session(challenge, "rev", intake=IntakeRequest(binary=name))
+                    workspace = row["workspace"]
+                    result = run_script(
+                        SKILL_DIR / "assets" / "solver.py",
+                        "--workspace", str(workspace), "--binary", str(target),
+                        "--candidate", "input",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    payload = json.loads(result.stdout)
+                    self.assertEqual(Path(payload["output"]).read_bytes(), b"captured\n")
+                    attestation = json.loads(Path(payload["attestation"]).read_text())
+                    self.assertEqual(attestation["source_target"], f"local:{target}")
 
     def test_init_creates_session_local_ida_gdb_and_oracle_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -17,6 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "ctf-common" / "scripts"
 sys.path.insert(0, str(REPO_ROOT / "ctf-common" / "scripts"))
 
+import ctf_workspace as workspace_module  # noqa: E402
+
 from ctf_intake import (  # noqa: E402
     MAX_FIELD_BYTES,
     MAX_STATEMENT_BYTES,
@@ -31,6 +33,8 @@ from ctf_workspace import (  # noqa: E402
     CollisionError,
     InvalidInput,
     MAX_ARTIFACT_BYTES,
+    MAX_MANIFEST_BYTES,
+    challenge_fingerprint,
     create_session,
     publish_capture_attestation,
     publish_finding,
@@ -177,6 +181,32 @@ class CommonWorkspaceTests(unittest.TestCase):
         self.assertTrue((managed / "runs").is_dir())
         self.assertEqual(row["workspace"].parents[4], managed)
 
+    def test_event_containment_rejects_traversal_before_manifest_access(self) -> None:
+        outside = self.root.parent / "outside"
+        outside.mkdir()
+        (outside / "challenge.yaml").write_bytes(b"\xff")
+        cases = (
+            (self.root / ".." / "outside", self.root),
+            (self.challenge / ".." / "..", self.root),
+            (self.challenge, self.root / "challenges" / ".."),
+        )
+        for challenge, event in cases:
+            with self.subTest(challenge=challenge, event=event):
+                with patch.object(
+                    workspace_module, "_manifest_scalars",
+                    side_effect=AssertionError("manifest accessed before containment"),
+                ):
+                    with self.assertRaises(InvalidInput):
+                        create_session(challenge, "web", event)
+                result = run_common_script(
+                    "init_session.py", str(challenge), "--category", "web",
+                    "--event-root", str(event),
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+        self.assertFalse((self.root / "runs").exists())
+
     def test_request_json_stdin_is_inert_lossless_and_single_document(self) -> None:
         challenge = Path(self.temp.name) / "stdin-web"
         challenge.mkdir()
@@ -289,6 +319,60 @@ class CommonWorkspaceTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(json.loads(result.stdout)["status"], "error")
                 self.assertFalse((event / "runs").exists())
+
+    def test_legacy_manifest_bounds_raw_comments_and_unknown_fields(self) -> None:
+        for prefix in (b"# ", b"unknown: "):
+            with self.subTest(prefix=prefix):
+                (self.challenge / "challenge.yaml").write_bytes(
+                    prefix + b"x" * (MAX_MANIFEST_BYTES - len(prefix)) + b"\n"
+                )
+                result = run_common_script(
+                    "init_session.py", str(self.challenge), "--category", "web",
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stderr, "")
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["status"], "error")
+                self.assertIn("manifest", payload["error"])
+                self.assertIn("exceeds", payload["error"])
+                self.assertFalse((self.root / "runs").exists())
+
+    def test_legacy_manifest_size_is_checked_before_reading(self) -> None:
+        (self.challenge / "challenge.yaml").write_bytes(b"#" + b"x" * 128)
+        with patch.object(workspace_module, "MAX_MANIFEST_BYTES", 128):
+            with patch.object(
+                workspace_module.os, "read",
+                side_effect=AssertionError("oversized manifest was read"),
+            ):
+                with self.assertRaisesRegex(InvalidInput, "manifest.*exceeds"):
+                    create_session(self.challenge, "web")
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_legacy_manifest_growth_is_bounded_during_reading(self) -> None:
+        manifest = self.challenge / "challenge.yaml"
+        manifest.write_bytes(b"#" + b"x" * 127)
+        original_read = os.read
+        grown = False
+
+        def grow_then_read(descriptor: int, count: int) -> bytes:
+            nonlocal grown
+            if not grown:
+                with manifest.open("ab") as stream:
+                    stream.write(b"x")
+                grown = True
+            return original_read(descriptor, count)
+
+        with patch.object(workspace_module, "MAX_MANIFEST_BYTES", 128):
+            with patch.object(workspace_module.os, "read", side_effect=grow_then_read):
+                with self.assertRaisesRegex(InvalidInput, "manifest.*exceeds"):
+                    create_session(self.challenge, "web")
+        self.assertFalse((self.root / "runs").exists())
+
+    def test_legacy_manifest_accepts_exact_raw_byte_limit(self) -> None:
+        (self.challenge / "challenge.yaml").write_bytes(b"#" + b"x" * 127)
+        with patch.object(workspace_module, "MAX_MANIFEST_BYTES", 128):
+            row = create_session(self.challenge, "web")
+        self.assertTrue((row["workspace"] / "session.json").is_file())
 
     def test_conflicting_legacy_target_representations_fail_before_allocation(self) -> None:
         cases = (
@@ -597,6 +681,65 @@ class CommonWorkspaceTests(unittest.TestCase):
         )
         self.assertEqual(stored["file_fingerprint"], same_a["file_fingerprint"])
         self.assertEqual(stored["fingerprint"], same_a["fingerprint"])
+
+    def test_fingerprint_rejects_unselected_links_and_nonregular_artifacts(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "input").write_bytes(b"outside input")
+        for kind in ("file-link", "directory-link", "dangling-link", "fifo"):
+            with self.subTest(kind=kind):
+                challenge = self.root / kind
+                nested = challenge / "nested"
+                nested.mkdir(parents=True)
+                artifact = nested / "artifact"
+                if kind == "fifo":
+                    os.mkfifo(artifact)
+                else:
+                    target = {
+                        "file-link": outside / "input",
+                        "directory-link": outside,
+                        "dangling-link": outside / "missing",
+                    }[kind]
+                    artifact.symlink_to(target, target_is_directory=kind == "directory-link")
+                result = run_common_script(
+                    "init_session.py", str(challenge), "--category", "web", timeout=2,
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(json.loads(result.stdout)["status"], "error")
+                self.assertFalse((self.root / "runs").exists())
+
+    def test_fingerprint_content_cannot_absorb_another_file_record(self) -> None:
+        single = self.root / "one-file"
+        multiple = self.root / "two-files"
+        single.mkdir()
+        multiple.mkdir()
+        (single / "a").write_bytes(b"prefix" + (1).to_bytes(8, "big") + b"b" + b"suffix")
+        (multiple / "a").write_bytes(b"prefix")
+        (multiple / "b").write_bytes(b"suffix")
+
+        self.assertNotEqual(challenge_fingerprint(single), challenge_fingerprint(multiple))
+
+    def test_fingerprint_rejects_artifact_replaced_with_symlink_after_stat(self) -> None:
+        artifact = self.challenge / "input.bin"
+        before = artifact.stat()
+        outside = self.root / "outside-input"
+        outside.write_bytes(b"outside input")
+        original_stat = os.stat
+        replaced = False
+
+        def replace_after_stat(path, *args, **kwargs):
+            nonlocal replaced
+            metadata = original_stat(path, *args, **kwargs)
+            if not replaced and (metadata.st_dev, metadata.st_ino) == (before.st_dev, before.st_ino):
+                replaced = True
+                artifact.unlink()
+                artifact.symlink_to(outside)
+            return metadata
+
+        with patch.object(workspace_module.os, "stat", side_effect=replace_after_stat):
+            with self.assertRaises(InvalidInput):
+                challenge_fingerprint(self.challenge)
 
     def test_challenges_and_categories_receive_isolated_workspaces(self) -> None:
         web = create_session(self.challenge, "web")

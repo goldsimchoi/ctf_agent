@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 
@@ -17,28 +16,18 @@ sys.path.insert(0, str(COMMON_SCRIPTS))
 from ctf_workspace import (  # noqa: E402
     CollisionError,
     InvalidInput,
+    _parse_manifest_scalars as manifest_scalars,
     _read_regular_under,
     publish_capture_attestation,
 )
 
 
-def manifest_scalars(data: bytes) -> dict[str, str]:
-    values: dict[str, str] = {}
-    for line in data.decode("utf-8", errors="strict").splitlines():
-        match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*?)\s*(?:#.*)?$", line)
-        if match:
-            key, value = match.groups()
-            value = value.strip().strip("'\"")
-            if value and not value.startswith(("[", "{", "|", ">")):
-                values[key] = value
-    return values
-
-
 def bound_source_target(workspace: Path, session: dict[str, object], manifest: dict[str, str], supplied: str) -> str:
+    if manifest.get("authorized") != "true":
+        raise InvalidInput("resolved manifest does not authorize a target capture")
     source_target = supplied.strip()
     if (
-        manifest.get("authorized") == "true"
-        and manifest.get("network_access") == "agent_allowed"
+        manifest.get("network_access") == "agent_allowed"
         and manifest.get("host")
         and manifest.get("port")
     ):
