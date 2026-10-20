@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
+import os
+import socket
+import subprocess
 import sys
 import zlib
 from pathlib import Path
@@ -32,7 +36,7 @@ def _url_origin(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}".lower()
 
 
-def manifest_origin(workspace: Path) -> str:
+def manifest_values(workspace: Path) -> dict[str, str]:
     workspace = session_workspace(workspace)
     values: dict[str, str] = {}
     try:
@@ -43,7 +47,63 @@ def manifest_origin(workspace: Path) -> str:
         if ":" not in line or line.lstrip().startswith("#"):
             continue
         key, value = line.split(":", 1)
-        values[key.strip()] = value.strip().strip("'\"")
+        value = value.strip()
+        if value.startswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = value.strip('"')
+        values[key.strip()] = value.strip("'")
+    return values
+
+
+LOCAL_INTERFACE_PREFIXES = ("docker", "br-", "veth", "cni", "podman", "virbr", "lo")
+
+
+def _local_networks() -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    """Return loopback plus container/bridge networks attached to this host."""
+    networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [
+        ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::1/128"),
+    ]
+    try:
+        result = subprocess.run(["ip", "-j", "addr"], text=True, capture_output=True, timeout=5, check=False)
+        interfaces = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        interfaces = []
+    for interface in interfaces:
+        name = str(interface.get("ifname", ""))
+        for address in interface.get("addr_info", []):
+            try:
+                host = ipaddress.ip_interface(f"{address['local']}/{address['prefixlen']}")
+            except (KeyError, ValueError):
+                continue
+            # Every address of this machine is local; whole bridge subnets are containers.
+            networks.append(ipaddress.ip_network(f"{host.ip}/{host.ip.max_prefixlen}"))
+            if name.startswith(LOCAL_INTERFACE_PREFIXES):
+                networks.append(host.network)
+    return networks
+
+
+def is_local_origin(origin: str) -> bool:
+    """True when an origin resolves to this machine or a local container network."""
+    if os.environ.get("CTF_TESTING_ALLOW_LOCAL_TARGET") == "1":
+        return False
+    host = (urlsplit(origin).hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost") or host in {"host.docker.internal", "gateway.docker.internal"}:
+        return True
+    try:
+        addresses = {ipaddress.ip_address(host)}
+    except ValueError:
+        try:
+            addresses = {ipaddress.ip_address(item[4][0]) for item in socket.getaddrinfo(host, None)}
+        except (OSError, ValueError):
+            return False
+    networks = _local_networks()
+    return any(address in network for address in addresses for network in networks if address.version == network.version)
+
+
+def manifest_origin(workspace: Path) -> str:
+    values = manifest_values(workspace)
     if values.get("authorized", "").lower() != "true":
         raise WebStateError("manifest does not authorize target traffic")
     if values.get("network_access") != "agent_allowed":
@@ -178,7 +238,10 @@ def sent_history(workspace: Path, prepared_paths: list[Path]) -> bytes | None:
 def validate_response_provenance(workspace: Path, evidence: Path) -> dict:
     """Return the recorded provenance for one unchanged captured response body."""
     workspace = session_workspace(workspace)
-    origin = manifest_origin(workspace)
+    allowed = {manifest_origin(workspace)}
+    callback = manifest_values(workspace).get("callback_origin")
+    if callback:
+        allowed.add(_origin(callback))
     responses = workspace / "web" / "responses"
     requests = workspace / "web" / "requests"
     evidence = evidence.expanduser().absolute()
@@ -196,9 +259,9 @@ def validate_response_provenance(workspace: Path, evidence: Path) -> dict:
     if (
         record.get("kind") != "web-http-response-v1"
         or record.get("authorized") is not True
-        or record.get("authorized_origin") != origin
+        or record.get("authorized_origin") not in allowed
         or request.parent != requests.absolute()
-        or _url_origin(str(record.get("request_url", ""))) != origin
+        or _url_origin(str(record.get("request_url", ""))) != record.get("authorized_origin")
     ):
         raise WebStateError("response provenance is invalid for this authorized web session")
     try:

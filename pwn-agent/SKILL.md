@@ -1,6 +1,6 @@
 ---
 name: pwn-agent
-description: Use when the user asks Codex to solve an authorized CTF pwnable, analyze an ELF, write or test a pwntools exploit, debug with GDB or idalib, or retrieve and verify a flag from a supplied local or manifest-scoped target.
+description: Use when the user asks to solve an authorized CTF pwnable, analyze an ELF, write or test a pwntools exploit, debug with GDB or idalib, or retrieve and verify a flag from a supplied local or manifest-scoped target.
 ---
 
 # Pwn Agent

@@ -4,6 +4,7 @@ import hashlib
 import http.server
 import os
 import base64
+import ssl
 from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 import yaml
+import requests
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +29,7 @@ VERIFY_WEB_FLAG = SKILL_DIR / "scripts" / "verify_web_flag.py"
 sys.path.insert(0, str(SKILL_DIR / "scripts"))
 sys.path.insert(0, str(COMMON_SCRIPTS))
 from web_provenance import prepared_sent_evidence, sent_history  # noqa: E402
+from init_web_state import web_lock  # noqa: E402
 from ctf_intake import IntakeRequest  # noqa: E402
 from ctf_workspace import MAX_ARTIFACT_BYTES, create_session  # noqa: E402
 GZIP_BODY = gzip.compress(b"FLAG{compressed_target_result}", mtime=0)
@@ -45,13 +48,37 @@ os.execv(sys.executable, [sys.executable, *sys.argv[2:]])
 """
 
 
-def run_script(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_script(path: Path, *args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(path), *args],
         text=True,
         capture_output=True,
         check=False,
+        env=None if env is None else {**os.environ, **env},
     )
+
+
+FILLED_ANALYSIS = """# Analysis
+
+## Flag location
+The flag is returned by the test server response body for the target route.
+
+## Attack surface
+GET routes on the loopback test server with query, form, and JSON inputs.
+
+## Vulnerability
+The test handler discloses the flag directly to any unauthenticated request.
+
+## Exploit path
+Send the single request recorded by request.py and read the captured body.
+"""
+
+
+def fill_analysis(workspace: Path) -> None:
+    path = workspace / "analysis.md"
+    if not path.exists() or "<!--" in path.read_text(encoding="utf-8"):
+        path.unlink(missing_ok=True)
+        path.write_text(FILLED_ANALYSIS, encoding="utf-8")
 
 
 def start_ready_request(
@@ -124,6 +151,20 @@ class CountHandler(http.server.BaseHTTPRequestHandler):
         self.server.hits += 1
         self.send_response(200)
         self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+class ProxyHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        self.server.paths.append(self.path)
+        body = b"FLAG{proxy_capture}"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:
         pass
@@ -333,6 +374,25 @@ class SameUrlChainHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class FixedBodyHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.server.hits += 1
+        if self.path == "/redirect":
+            self.send_response(302)
+            self.send_header("Location", self.server.location)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        body = self.server.body
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
 @contextmanager
 def local_server(handler: type[http.server.BaseHTTPRequestHandler]):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -345,6 +405,30 @@ def local_server(handler: type[http.server.BaseHTTPRequestHandler]):
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+@contextmanager
+def local_tls_server(handler: type[http.server.BaseHTTPRequestHandler]):
+    with tempfile.TemporaryDirectory() as cert_dir:
+        cert, key = Path(cert_dir) / "cert.pem", Path(cert_dir) / "key.pem"
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-subj", "/CN=localhost", "-keyout", str(key), "-out", str(cert)],
+            check=True, capture_output=True,
+        )
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        server.hits = 0
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server, f"https://127.0.0.1:{server.server_port}"
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
 
 
 class WebAgentTests(unittest.TestCase):
@@ -407,7 +491,12 @@ class WebAgentTests(unittest.TestCase):
         return run_script(REQUEST, "--workspace", str(workspace), "--url", url, *args)
 
     def verify(self, workspace: Path, *args: str) -> subprocess.CompletedProcess[str]:
-        return run_script(VERIFY_WEB_FLAG, "--workspace", str(workspace), *args)
+        # Test servers listen on loopback, which the verifier otherwise treats as a lab.
+        fill_analysis(workspace)
+        return run_script(
+            VERIFY_WEB_FLAG, "--workspace", str(workspace), *args,
+            env={"CTF_TESTING_ALLOW_LOCAL_TARGET": "1"},
+        )
 
     def test_metadata_and_challenge_asset_are_structured_for_web(self) -> None:
         metadata = yaml.safe_load(
@@ -496,6 +585,91 @@ The event prose may contain `code`, $(shell-looking text), and \"quotes\"."""
                 self.assertTrue(Path(state["responses_dir"]).is_dir())
                 coverage = json.loads(Path(state["coverage"]).read_text(encoding="utf-8"))
                 self.assertEqual(coverage["entries"], [])
+
+    def test_request_uses_explicit_loopback_proxy_and_keeps_capture_evidence(self) -> None:
+        with (
+            local_server(TargetHandler) as (target, origin),
+            local_server(ProxyHandler) as (proxy, proxy_origin),
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            proxy.paths = []
+            workspace = self.make_workspace(Path(temp), "web-proxy", origin)
+            self.init_web_state(workspace)
+            result = self.request(workspace, origin + "/entry?x=1", "--proxy", proxy_origin)
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            evidence = json.loads(result.stdout)
+            self.assertEqual(Path(evidence["response_entity_body"]).read_bytes(), b"FLAG{proxy_capture}")
+            self.assertEqual(proxy.paths, [origin + "/entry?x=1"])
+            self.assertEqual(target.hits, 0)
+            self.assertTrue(Path(evidence["provenance"]).is_file())
+
+    def test_request_rejects_nonlocal_proxy_before_network(self) -> None:
+        with local_server(TargetHandler) as (target, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-remote-proxy", origin)
+            self.init_web_state(workspace)
+            result = self.request(workspace, origin + "/entry?x=1", "--proxy", "http://example.invalid:8080")
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("loopback HTTP listener", json.loads(result.stdout)["error"])
+            self.assertEqual(target.hits, 0)
+
+    def test_web_lock_preserves_request_timeout_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-lock-timeout")
+            self.init_web_state(workspace)
+            with self.assertRaisesRegex(requests.exceptions.ReadTimeout, "simulated timeout"):
+                with web_lock(workspace, ".history.lock"):
+                    raise requests.exceptions.ReadTimeout("simulated timeout")
+
+    def test_burp_request_file_replays_same_origin_post_with_capture(self) -> None:
+        with local_server(EchoHandler) as (target, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-burp-import", origin)
+            self.init_web_state(workspace)
+            body = b"username=FLAG%7Bburp_import%7D&password=example"
+            raw = workspace / "web" / "requests" / "burp-login.txt"
+            raw.write_bytes(
+                (f"POST /login HTTP/1.1\r\nHost: {urlsplit(origin).netloc}\r\n"
+                 f"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {len(body)}\r\n\r\n").encode()
+                + body
+            )
+
+            result = run_script(REQUEST, "--workspace", str(workspace), "--burp-request-file", str(raw))
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            evidence = json.loads(result.stdout)
+            self.assertEqual(Path(evidence["response_entity_body"]).read_bytes(), b"FLAG{burp_import}")
+            prepared = json.loads(Path(evidence["prepared_request"]).read_text(encoding="utf-8"))
+            self.assertEqual(prepared["method"], "POST")
+            self.assertEqual(prepared["url"], origin + "/login")
+            self.assertEqual(base64.b64decode(prepared["body_base64"]), body)
+            self.assertEqual(target.hits, 1)
+
+    def test_burp_request_file_rejects_other_origin_before_network(self) -> None:
+        with local_server(CountHandler) as (target, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-burp-wrong-host", origin)
+            self.init_web_state(workspace)
+            raw = workspace / "web" / "requests" / "wrong-host.txt"
+            raw.write_text(
+                f"GET http://example.invalid/outside HTTP/1.1\r\nHost: {urlsplit(origin).netloc}\r\n\r\n",
+                encoding="ascii",
+            )
+            result = run_script(REQUEST, "--workspace", str(workspace), "--burp-request-file", str(raw))
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("outside the authorized manifest origin", json.loads(result.stdout)["error"])
+            self.assertEqual(target.hits, 0)
+
+    def test_explicit_insecure_tls_allows_lab_certificate(self) -> None:
+        with local_tls_server(TargetHandler) as (target, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.make_workspace(Path(temp), "web-insecure-lab", origin)
+            self.init_web_state(workspace)
+            result = self.request(workspace, origin + "/entry?x=1", "--insecure-tls")
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            evidence = json.loads(result.stdout)
+            self.assertEqual(Path(evidence["response_entity_body"]).read_bytes(), b"FLAG{fileless_black_box}")
+            self.assertEqual(target.hits, 1)
 
     def test_coverage_keeps_distinct_full_tuple_keys(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -632,6 +806,7 @@ The event prose may contain `code`, $(shell-looking text), and \"quotes\"."""
                 "--timeout", "0.1", "--progress", "new fact: timeout after store",
             )
             self.assertEqual(failed.returncode, 2, failed.stderr)
+            self.assertIn("timed out", json.loads(failed.stdout)["error"].lower())
             self.assertTrue(server.accepted.wait(timeout=2))
             history = json.loads((workspace / "web" / "history.json").read_text(encoding="utf-8"))
             self.assertEqual(len(history["requests"]), 1)
@@ -1118,6 +1293,118 @@ The event prose may contain `code`, $(shell-looking text), and \"quotes\"."""
 
             verified = self.verify(workspace, "--output", response["response_entity_body"])
             self.assertEqual(verified.returncode, 2)
+
+    def fixed_flag_workspace(self, root: Path, origin: str, session_id: str) -> Path:
+        workspace = self.make_workspace(root, session_id, origin)
+        self.init_web_state(workspace)
+        return workspace
+
+    def captured(self, workspace: Path, url: str, progress: str) -> str:
+        result = self.request(workspace, url, "--progress", progress)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        return json.loads(result.stdout)["response_entity_body"]
+
+    def test_verifier_rejects_placeholder_flag_shipped_with_challenge(self) -> None:
+        with local_server(FixedBodyHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.fixed_flag_workspace(root, origin, "web-supplied-placeholder")
+            challenge = root / "event" / "challenges" / "portal"
+            (challenge / "Dockerfile").write_text("ENV FLAG=FLAG{fake_docker_flag}\n", encoding="utf-8")
+            server.body = b"welcome FLAG{fake_docker_flag}"
+            rejected = self.verify(workspace, "--output", self.captured(workspace, origin + "/flag", "new fact: one"))
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(json.loads(rejected.stdout)["reason"], "candidate_in_supplied_files")
+
+            server.body = b"welcome FLAG{real_remote_flag}"
+            verified = self.verify(workspace, "--output", self.captured(workspace, origin + "/flag?2", "new fact: two"))
+            self.assertEqual(verified.returncode, 0, verified.stdout)
+            self.assertEqual(json.loads(verified.stdout)["flag"], "FLAG{real_remote_flag}")
+
+    def test_verifier_rejects_placeholder_inside_supplied_archive(self) -> None:
+        import io
+        import zipfile
+
+        with local_server(FixedBodyHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = self.fixed_flag_workspace(root, origin, "web-archive-placeholder")
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, "w") as archive:
+                archive.writestr("app/flag.txt", "FLAG{zipped_placeholder}")
+            outer = io.BytesIO()
+            with zipfile.ZipFile(outer, "w") as archive:
+                archive.writestr("source.zip", inner.getvalue())
+            (root / "event" / "challenges" / "portal" / "dist.zip").write_bytes(outer.getvalue())
+            server.body = b"FLAG{zipped_placeholder}"
+            rejected = self.verify(workspace, "--output", self.captured(workspace, origin + "/flag", "new fact: zip"))
+            self.assertEqual(json.loads(rejected.stdout)["reason"], "candidate_in_supplied_files")
+
+    def test_verifier_rejects_flag_seen_in_local_lab(self) -> None:
+        with local_server(FixedBodyHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.fixed_flag_workspace(Path(temp), origin, "web-lab-placeholder")
+            (workspace / "web" / "lab" / "local-run.txt").write_text("got FLAG{seen_in_lab}\n", encoding="utf-8")
+            server.body = b"FLAG{seen_in_lab}"
+            rejected = self.verify(workspace, "--output", self.captured(workspace, origin + "/flag", "new fact: lab"))
+            self.assertEqual(rejected.returncode, 2)
+            self.assertEqual(json.loads(rejected.stdout)["reason"], "candidate_matches_lab_flag")
+
+    def test_verifier_treats_loopback_target_as_lab_only(self) -> None:
+        with local_server(FixedBodyHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.fixed_flag_workspace(Path(temp), origin, "web-loopback-lab")
+            server.body = b"FLAG{local_container_value}"
+            body = self.captured(workspace, origin + "/flag", "new fact: loopback")
+            fill_analysis(workspace)
+            result = run_script(VERIFY_WEB_FLAG, "--workspace", str(workspace), "--output", body)
+            self.assertEqual(result.returncode, 2)
+            payload = json.loads(result.stdout)
+            self.assertEqual((payload["status"], payload["reason"]), ("lab_only", "target_origin_is_local"))
+            self.assertIsNone(payload["flag"])
+
+    def test_verifier_requires_completed_analysis(self) -> None:
+        with local_server(FixedBodyHandler) as (server, origin), tempfile.TemporaryDirectory() as temp:
+            workspace = self.fixed_flag_workspace(Path(temp), origin, "web-analysis-gate")
+            self.assertIn("## Flag location", (workspace / "analysis.md").read_text(encoding="utf-8"))
+            server.body = b"FLAG{needs_analysis}"
+            body = self.captured(workspace, origin + "/flag", "new fact: analysis")
+            result = run_script(
+                VERIFY_WEB_FLAG, "--workspace", str(workspace), "--output", body,
+                env={"CTF_TESTING_ALLOW_LOCAL_TARGET": "1"},
+            )
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["reason"], "analysis_incomplete")
+            self.assertEqual(payload["missing_sections"], ["Flag location", "Attack surface", "Vulnerability", "Exploit path"])
+
+    def test_callback_receiver_is_reachable_but_not_through_target_redirect(self) -> None:
+        with local_server(FixedBodyHandler) as (target, origin), local_server(FixedBodyHandler) as (receiver, callback), \
+                tempfile.TemporaryDirectory() as temp:
+            challenge = Path(temp) / "event" / "challenges" / "bot"
+            challenge.mkdir(parents=True)
+            row = create_session(
+                challenge, "web", event_root=Path(temp) / "event",
+                intake=IntakeRequest(statement="XSS bot challenge.", target=origin + "/", callback=callback + "/hook?id=1"),
+            )
+            workspace = Path(row["workspace"])
+            manifest = (workspace / "challenge.resolved.yaml").read_text(encoding="utf-8")
+            self.assertIn(f"callback_origin: {callback}", manifest)
+            self.init_web_state(workspace)
+            receiver.body = b"delivered FLAG{out_of_band}"
+            body = self.captured(workspace, callback + "/hook?id=1", "new fact: poll receiver")
+            verified = self.verify(workspace, "--output", body)
+            self.assertEqual(json.loads(verified.stdout)["flag"], "FLAG{out_of_band}", verified.stdout)
+
+            target.location = callback + "/hook?id=1"
+            redirected = self.request(workspace, origin + "/redirect", "--progress", "new fact: redirect")
+            self.assertEqual(redirected.returncode, 2)
+            self.assertIn("redirect leaves the origin", redirected.stdout)
+            outside = self.request(workspace, "http://127.0.0.2:9/", "--progress", "new fact: outside")
+            self.assertIn("outside the authorized manifest origin", outside.stdout)
+
+    def test_callback_intake_is_web_only_and_separate_from_target(self) -> None:
+        from ctf_intake import IntakeError, resolve_intake
+
+        with self.assertRaises(IntakeError):
+            resolve_intake("pwn", IntakeRequest(target="tcp://pwn.example:1", callback="https://hook.example/"), {})
+        with self.assertRaises(IntakeError):
+            resolve_intake("web", IntakeRequest(target="https://chal.example/", callback="https://chal.example/x"), {})
 
 
 if __name__ == "__main__":

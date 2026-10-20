@@ -1,6 +1,6 @@
 ---
 name: rev-agent
-description: Use when the user asks Codex to solve an authorized CTF reversing challenge, analyze a supplied binary, recover a checker input, or build and verify a local solver, keygen, emulator, or patch.
+description: Use when the user asks to solve an authorized CTF reversing challenge, analyze a supplied binary, recover a checker input, or build and verify a local solver, keygen, emulator, or patch.
 ---
 
 # Reversing Agent

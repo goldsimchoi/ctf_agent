@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,12 +23,37 @@ from ctf_workspace import (  # noqa: E402
     _read_regular_under,
     _safe_directory,
     _workspace_root,
+    _write_new_bytes,
     _write_new_json,
 )
 
 
 class WebStateError(ValueError):
     """Raised for invalid or non-web session state."""
+
+
+ANALYSIS_SECTIONS = ("Flag location", "Attack surface", "Vulnerability", "Exploit path")
+ANALYSIS_TEMPLATE = """# Analysis
+
+Fill every section from evidence before claiming a solve. Cite file:line for
+source, or a web/responses/ path for black-box observations.
+
+## Flag location
+<!-- Where the real flag lives on the remote target (env, file, DB row, admin
+page) and which condition normally prevents an ordinary user from reading it. -->
+
+## Attack surface
+<!-- Routes, methods, and every input location (query, form, JSON, headers,
+cookies, path, storage, WebSocket). Note middleware/handler mismatches. -->
+
+## Vulnerability
+<!-- The flaw, the exact source or response evidence for it, and why the
+filters or checks in front of it do not stop it. -->
+
+## Exploit path
+<!-- Ordered steps from an unauthenticated session to the flag, and which
+capability each step earns. -->
+"""
 
 
 def session_workspace(workspace: Path) -> Path:
@@ -55,22 +81,46 @@ def web_lock(workspace: Path, name: str) -> Iterator[None]:
     """Lock one web-state file through a no-follow directory descriptor."""
     web = web_directory(workspace)
     directory = _open_directory_nofollow(web)
-    descriptor: int | None = None
     try:
-        descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-        with os.fdopen(descriptor, "a+", encoding="utf-8") as stream:
-            descriptor = None
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            descriptor = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+        except OSError as exc:
+            raise WebStateError("unsafe web state lock") from exc
+        try:
+            stream = os.fdopen(descriptor, "a+", encoding="utf-8")
+        except OSError as exc:
+            os.close(descriptor)
+            raise WebStateError("unsafe web state lock") from exc
+        with stream:
+            try:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            except OSError as exc:
+                raise WebStateError("unsafe web state lock") from exc
             try:
                 yield
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-    except OSError as exc:
-        raise WebStateError("unsafe web state lock") from exc
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
         os.close(directory)
+
+
+def analysis_gaps(workspace: Path) -> list[str]:
+    """Return analysis sections that are missing or still only template comments."""
+    try:
+        text = _read_regular_under(workspace, workspace / "analysis.md", "analysis").data.decode("utf-8")
+    except (InvalidInput, UnicodeDecodeError):
+        return list(ANALYSIS_SECTIONS)
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
+    bodies: dict[str, str] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        heading = re.match(r"^##\s+(.+?)\s*$", line)
+        if heading:
+            current = heading.group(1).strip().lower()
+            bodies.setdefault(current, "")
+        elif current is not None:
+            bodies[current] += line.strip()
+    return [name for name in ANALYSIS_SECTIONS if len(bodies.get(name.lower(), "")) < 20]
 
 
 def atomic_json(path: Path, payload: dict[str, Any]) -> None:
@@ -97,6 +147,8 @@ def init_web_state(workspace: Path) -> dict[str, str]:
     responses_dir = web_directory(workspace, "responses")
     provenance_dir = web_directory(workspace, "provenance")
     captures_dir = web_directory(workspace, "captures")
+    lab_dir = web_directory(workspace, "lab")
+    runs_dir = web_directory(workspace, "runs")
     profile = web_directory(workspace, "browser-profile")
     files = {
         "cookies.json": {"cookies": [], "schema_version": 1},
@@ -109,12 +161,19 @@ def init_web_state(workspace: Path) -> dict[str, str]:
             write_new_json(web / name, payload)
         except FileExistsError:
             pass
+    try:
+        _write_new_bytes(workspace / "analysis.md", ANALYSIS_TEMPLATE.encode("utf-8"))
+    except FileExistsError:
+        pass
+    except (InvalidInput, OSError) as exc:
+        raise WebStateError("unsafe analysis write") from exc
     return {
         "workspace": str(workspace), "web_root": str(web), "cookie_jar": str(web / "cookies.json"),
         "browser_profile": str(profile), "coverage": str(web / "coverage.json"),
         "requests_dir": str(requests_dir), "responses_dir": str(responses_dir),
         "provenance_dir": str(provenance_dir), "captures_dir": str(captures_dir),
         "history": str(web / "history.json"), "capabilities": str(web / "capabilities.json"),
+        "analysis": str(workspace / "analysis.md"), "lab_dir": str(lab_dir), "runs_dir": str(runs_dir),
     }
 
 

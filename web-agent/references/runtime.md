@@ -25,3 +25,7 @@ For browser storage or WebSockets, save exported storage/message bytes beneath
 the owning `web/responses/` directory. `ffuf`, `sqlmap`, `httpx`, and `nuclei`
 are optional accelerators, never authorization expansion; record the precise
 command and raw output when used.
+
+Docker is for the local lab only (see `lab.md`). Keep lab logs and local exploit
+output under `web/lab/`; never under `web/responses/`, which holds remote target
+evidence.

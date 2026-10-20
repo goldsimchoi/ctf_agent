@@ -11,7 +11,8 @@ the boundary for every subsequent request and redirect. Without a selected targe
 
 `init_web_state.py` creates `web/cookies.json`, `web/browser-profile/`,
 `web/coverage.json`, `web/capabilities.json`, `web/requests/`, `web/responses/`,
-and `web/provenance/` inside one common web workspace. These paths are session-owned;
+`web/provenance/`, `web/lab/`, and the `analysis.md` template inside one common
+web workspace. These paths are session-owned;
 the shared workspace's `state.json` remains owned by the common helpers.
 
 The coverage ledger has a full endpoint/method/location/parameter/technique key.
@@ -26,6 +27,20 @@ mode requires at least two submitted outputs and every output must have a
 different authorized request-chain ID and capture ID. Run
 `scripts/verify_web_flag.py`, not the common verifier directly; it validates
 provenance and forwards only the existing common attestation/output/sent trio.
+
+Before a candidate can become a flag, the web verifier also checks, in order:
+
+| Check | Result when it fails |
+|---|---|
+| Manifest origin is not loopback, this machine, or a Docker bridge network | `lab_only` / `target_origin_is_local` |
+| Every `analysis.md` section has real content | `unverified` / `analysis_incomplete` |
+| Candidate does not appear in the supplied challenge files, including nested zip/tar/gzip | `unverified` / `candidate_in_supplied_files` |
+| Candidate was not observed under `web/lab/` | `unverified` / `candidate_matches_lab_flag` |
+
+Responses from the declared `callback_origin` are verifiable like target
+responses, so an out-of-band delivery polled with `request.py` can complete a
+solve. Supplied-file rejection is web-only; reversing flags legitimately live in
+the supplied binary.
 
 Requests in one session serialize their history transaction so each later
 capture includes earlier submissions. Prepared evidence is committed before

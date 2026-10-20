@@ -23,7 +23,7 @@ COMMON = SKILL.parent / "ctf-common" / "scripts"
 sys.path.insert(0, str(SKILL / "scripts"))
 sys.path.insert(0, str(COMMON))
 from init_web_state import WebStateError, atomic_json, session_workspace, web_directory, web_lock  # noqa: E402
-from web_provenance import atomic_bytes, decode_entity_body, manifest_origin, sent_history, write_new_json  # noqa: E402
+from web_provenance import atomic_bytes, decode_entity_body, manifest_origin, manifest_values, sent_history, write_new_json  # noqa: E402
 from ctf_workspace import (  # noqa: E402
     MAX_ARTIFACT_BYTES,
     CollisionError,
@@ -42,9 +42,29 @@ def origin_of(url: str) -> str:
 
 def authorized_url(workspace: Path, url: str) -> str:
     origin = manifest_origin(workspace)
-    if origin_of(url) != origin:
-        raise ValueError("URL origin is outside the authorized manifest origin")
-    return origin
+    callback = manifest_values(workspace).get("callback_origin")
+    if origin_of(url) == origin:
+        return origin
+    # The user-owned out-of-band receiver may be polled for delivered results.
+    if callback and origin_of(url) == callback.lower():
+        return callback.lower()
+    raise ValueError("URL origin is outside the authorized manifest origin")
+
+
+def loopback_proxy(url: str) -> str:
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.port is None
+    ):
+        raise ValueError("proxy must be a loopback HTTP listener with an explicit port")
+    return url
 
 
 def load_session(workspace: Path, cookie_file: Path) -> requests.Session:
@@ -76,6 +96,54 @@ def pairs(values: list[str]) -> dict[str, str]:
             raise ValueError("empty input name")
         result[name] = item
     return result
+
+
+def parse_burp_request(raw: bytes, origin: str) -> tuple[str, str, dict[str, str], bytes]:
+    separator = b"\r\n\r\n" if b"\r\n\r\n" in raw else b"\n\n"
+    if separator not in raw:
+        raise ValueError("Burp request is missing the header/body separator")
+    head, body = raw.split(separator, 1)
+    lines = head.replace(b"\r\n", b"\n").split(b"\n")
+    try:
+        method, target, version = lines[0].decode("ascii").split(" ")
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Burp request has an invalid request line") from exc
+    if not method.isascii() or not method.isalpha() or version not in {"HTTP/1.0", "HTTP/1.1", "HTTP/2"}:
+        raise ValueError("Burp request has an unsupported request line")
+    if target.startswith("/") and not target.startswith("//"):
+        url = origin + target
+    elif target.startswith(("http://", "https://")):
+        url = target
+    else:
+        raise ValueError("Burp request target must be an absolute path or URL")
+    if "#" in target or origin_of(url) != origin:
+        raise ValueError("Burp request URL is outside the authorized manifest origin")
+    headers: dict[str, str] = {}
+    seen: set[str] = set()
+    host: str | None = None
+    for line in lines[1:]:
+        if b":" not in line or line[:1] in {b" ", b"\t"}:
+            raise ValueError("Burp request has a malformed header")
+        name, value = line.split(b":", 1)
+        try:
+            key, item = name.decode("ascii"), value.strip().decode("latin-1")
+        except UnicodeDecodeError as exc:
+            raise ValueError("Burp request has a malformed header") from exc
+        folded = key.lower()
+        if not key or folded in seen:
+            raise ValueError("Burp request has a duplicate or empty header")
+        seen.add(folded)
+        if folded == "host":
+            host = item
+        elif folded == "transfer-encoding":
+            raise ValueError("Burp request with transfer encoding is unsupported")
+        elif folded not in {"content-length", "connection", "proxy-connection"}:
+            headers[key] = item
+    if host is None or host.lower() != urlsplit(origin).netloc.lower():
+        raise ValueError("Burp request Host is outside the authorized manifest origin")
+    if method.upper() in {"GET", "HEAD"} and body:
+        raise ValueError("Burp GET/HEAD request body is unsupported")
+    return method.upper(), url, headers, body
 
 
 def record_attempt(workspace: Path, signature: str, progress: str | None) -> None:
@@ -218,7 +286,9 @@ def _error_evidence(workspace: Path, error: str) -> str | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--url", required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--url")
+    target.add_argument("--burp-request-file", type=Path)
     parser.add_argument("--method", default="GET")
     parser.add_argument("--header", action="append", default=[])
     parser.add_argument("--form", action="append", default=[])
@@ -226,20 +296,31 @@ def main() -> int:
     parser.add_argument("--data")
     parser.add_argument("--data-file", type=Path)
     parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--proxy", help="local HTTP proxy listener, such as http://127.0.0.1:8080")
+    parser.add_argument("--insecure-tls", action="store_true", help="allow an untrusted certificate for this request")
     parser.add_argument("--progress")
     args = parser.parse_args()
     try:
         workspace = session_workspace(args.workspace)
-        origin = authorized_url(workspace, args.url)
+        if args.burp_request_file:
+            if args.method != "GET" or args.header or args.form or args.json_body is not None or args.data is not None or args.data_file is not None:
+                raise ValueError("Burp request file cannot be combined with request content options")
+            snapshot = _read_regular_under(workspace, args.burp_request_file, "Burp request")
+            method, url, headers, data = parse_burp_request(snapshot.data, manifest_origin(workspace))
+            json_body, form = None, None
+        else:
+            method, url, headers = args.method.upper(), args.url, pairs(args.header)
+            data = args.data
+            if args.data_file is not None:
+                data = _read_regular_under(workspace, args.data_file, "request data file").data
+            json_body = json.loads(args.json_body) if args.json_body is not None else None
+            form = pairs(args.form) if args.form else None
+        origin = authorized_url(workspace, url)
+        proxy = loopback_proxy(args.proxy) if args.proxy else None
         if args.timeout <= 0 or (args.data is not None and args.data_file is not None):
             raise ValueError("timeout must be positive and data inputs must not conflict")
-        data: str | bytes | None = args.data
-        if args.data_file is not None:
-            data = _read_regular_under(workspace, args.data_file, "request data file").data
-        json_body = json.loads(args.json_body) if args.json_body is not None else None
-        form = pairs(args.form) if args.form else None
         signature_body = hashlib.sha256(_body(data) if data is not None else (args.json_body or "&".join(sorted(args.form))).encode()).hexdigest()
-        record_attempt(workspace, " | ".join((args.method.upper(), args.url, json.dumps(pairs(args.header), sort_keys=True), signature_body)), args.progress)
+        record_attempt(workspace, " | ".join((method, url, json.dumps(headers, sort_keys=True), signature_body)), args.progress)
         web = web_directory(workspace)
         with web_lock(workspace, ".history.lock"):
             session = load_session(workspace, web / "cookies.json")
@@ -248,10 +329,10 @@ def main() -> int:
             entries = _history_entries(workspace, history_file)
             prior_requests = [Path(str(entry["request"])) for entry in entries]
             request_id = secrets.token_hex(12)
-            method, url, captures = args.method.upper(), args.url, []
+            captures = []
             started = time.monotonic()
             for hop in range(6):
-                request_kwargs: dict[str, object] = {"headers": pairs(args.header)}
+                request_kwargs: dict[str, object] = {"headers": headers}
                 if method not in {"GET", "HEAD"}:
                     if data is not None:
                         request_kwargs["data"] = data
@@ -264,7 +345,12 @@ def main() -> int:
                 entry: dict[str, object] = {"request": str(request_file), "complete": False, "request_id": request_id, "hop": hop}
                 entries.append(entry)
                 _write_history(history_file, entries)
-                response = session.send(prepared, timeout=args.timeout, allow_redirects=False, stream=True)
+                send_options: dict[str, object] = {"timeout": args.timeout, "allow_redirects": False, "stream": True}
+                if proxy:
+                    send_options["proxies"] = {"http": proxy, "https": proxy}
+                if args.insecure_tls:
+                    send_options["verify"] = False
+                response = session.send(prepared, **send_options)
                 response_file, provenance_file, attestation = capture_hop(
                     workspace, session_record, request_id, hop, response, origin, prior_requests, request_file
                 )
@@ -276,7 +362,8 @@ def main() -> int:
                 if not location:
                     break
                 url = urljoin(url, location)
-                authorized_url(workspace, url)
+                if authorized_url(workspace, url) != origin:
+                    raise ValueError("redirect leaves the origin of the original request")
                 if response.status_code == 303 or (response.status_code in {301, 302} and method not in {"GET", "HEAD"}):
                     method, data, json_body, form = "GET", None, None, None
             else:

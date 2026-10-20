@@ -13,8 +13,8 @@ MAX_STATEMENT_BYTES = 256 * 1024
 MAX_FIELD_BYTES = 4 * 1024
 # JSON escaping can expand one valid UTF-8 byte to three wire bytes (for
 # example, U+0080 becomes ``\u0080`` under ensure_ascii JSON encoding).
-MAX_REQUEST_BYTES = 3 * (MAX_STATEMENT_BYTES + (3 * MAX_FIELD_BYTES)) + 1024
-REQUEST_FIELDS = frozenset({"statement", "target", "binary", "flag_pattern"})
+MAX_REQUEST_BYTES = 3 * (MAX_STATEMENT_BYTES + (4 * MAX_FIELD_BYTES)) + 1024
+REQUEST_FIELDS = frozenset({"statement", "target", "binary", "flag_pattern", "callback"})
 CATEGORIES = frozenset({"pwn", "web", "rev"})
 
 
@@ -28,6 +28,7 @@ class IntakeRequest:
     target: str | None = None
     binary: str | None = None
     flag_pattern: str | None = None
+    callback: str | None = None
 
 
 def _validate_text(name: str, value: str, maximum: int, *, multiline: bool) -> str:
@@ -56,7 +57,7 @@ def _validate_request(request: IntakeRequest) -> IntakeRequest:
         "statement", request.statement, MAX_STATEMENT_BYTES, multiline=True
     )
     fields: dict[str, str | None] = {}
-    for name in ("target", "binary", "flag_pattern"):
+    for name in ("target", "binary", "flag_pattern", "callback"):
         value = getattr(request, name)
         fields[name] = (
             None
@@ -284,6 +285,7 @@ def resolve_intake(
         or request.target is not None
         or request.binary is not None
         or request.flag_pattern is not None
+        or request.callback is not None
     )
     legacy_present = bool(legacy_values)
     source = (
@@ -301,6 +303,9 @@ def resolve_intake(
     manifest["category"] = category
     manifest.setdefault("mode", "race")
     normalized: dict[str, Any] = {}
+
+    if request.callback is not None and category != "web":
+        raise IntakeError("only web intake accepts an out-of-band callback")
 
     legacy_binary = legacy_values.get("binary")
     if category == "web" and (request.binary is not None or legacy_binary is not None):
@@ -349,6 +354,14 @@ def resolve_intake(
             _reject_authorization_conflict(legacy_values)
             manifest["authorized"] = "true"
             manifest["network_access"] = "agent_allowed"
+        if request.callback is not None:
+            # A user-owned receiver for out-of-band results, never a target.
+            callback = _normalize_web_target(request.callback)
+            if selected_target is not None and callback["origin"] == selected_target["origin"]:
+                raise IntakeError("callback must be a separate user-owned receiver")
+            normalized["callback_url"] = callback["start_url"]
+            manifest["callback_origin"] = callback["origin"]
+            manifest["callback_url"] = callback["start_url"]
         target_status = "bound" if selected_target is not None else "needs_selection"
     elif category == "pwn":
         legacy_target = _legacy_pwn_target(legacy_values)
@@ -399,6 +412,7 @@ def resolve_intake(
         "target_input": request.target,
         "binary": request.binary,
         "flag_pattern": request.flag_pattern,
+        "callback": request.callback,
         "normalized": normalized,
         "manifest": manifest,
     }

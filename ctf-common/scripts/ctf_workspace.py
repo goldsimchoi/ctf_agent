@@ -27,6 +27,8 @@ MAX_ARTIFACT_BYTES = 4 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_VERIFICATION_ARTIFACTS = 16
 MAX_VERIFICATION_BYTES = 8 * 1024 * 1024
+MAX_SUPPLIED_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_SUPPLIED_SCAN_BYTES = 256 * 1024 * 1024
 DEFAULT_PATTERNS = (
     rb"FLAG\{[^}\r\n]+\}",
     rb"flag\{[^}\r\n]+\}",
@@ -925,6 +927,82 @@ def _candidates(data: bytes, patterns: tuple[bytes, ...]) -> set[bytes]:
     return found
 
 
+def _archive_members(data: bytes) -> Iterator[bytes]:
+    """Yield bounded member contents of one zip, tar, or gzip blob."""
+    import gzip
+    import io
+    import tarfile
+    import zipfile
+
+    stream = io.BytesIO(data)
+    if zipfile.is_zipfile(stream):
+        try:
+            with zipfile.ZipFile(stream) as archive:
+                for info in archive.infolist():
+                    if not info.is_dir() and info.file_size <= MAX_SUPPLIED_MEMBER_BYTES:
+                        try:
+                            yield archive.read(info)
+                        except (RuntimeError, zipfile.BadZipFile, NotImplementedError, OSError):
+                            continue
+        except zipfile.BadZipFile:
+            pass
+        return
+    stream.seek(0)
+    try:
+        with tarfile.open(fileobj=stream, mode="r:*") as archive:
+            for member in archive:
+                if member.isfile() and member.size <= MAX_SUPPLIED_MEMBER_BYTES:
+                    extracted = archive.extractfile(member)
+                    if extracted is not None:
+                        yield extracted.read()
+        return
+    except (tarfile.TarError, OSError, EOFError):
+        pass
+    if data[:2] == b"\x1f\x8b":
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as single:
+                yield single.read(MAX_SUPPLIED_MEMBER_BYTES)
+        except (OSError, EOFError):
+            pass
+
+
+def supplied_candidates(challenge: Path, patterns: tuple[bytes, ...]) -> set[bytes]:
+    """Collect flag-shaped strings already present in the supplied challenge files.
+
+    A placeholder flag shipped with source or a Dockerfile is never a solve, so
+    any candidate found here, including inside one level of nested archives, is
+    rejected by verification.
+    """
+    found: set[bytes] = set()
+    budget = [MAX_SUPPLIED_SCAN_BYTES]
+
+    def scan(data: bytes, depth: int) -> None:
+        if budget[0] <= 0:
+            return
+        budget[0] -= len(data)
+        found.update(_candidates(data, patterns))
+        if depth < 2:
+            for member in _archive_members(data):
+                scan(member, depth + 1)
+
+    try:
+        root = _resolve_directory(challenge, "challenge")
+    except InvalidInput:
+        return found
+    for path in sorted(root.rglob("*")):
+        if budget[0] <= 0:
+            break
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            if path.stat().st_size > MAX_SUPPLIED_MEMBER_BYTES:
+                continue
+            scan(path.read_bytes(), 0)
+        except OSError:
+            continue
+    return found
+
+
 def _candidate_only(reason: str, candidates: set[bytes]) -> dict[str, Any]:
     candidate = min(candidates, key=lambda item: (len(item), item)) if candidates else None
     return {
@@ -1038,6 +1116,8 @@ def verify_outputs(
     strict: bool,
     workspace: Path | None = None,
     attestations: list[Path] | None = None,
+    excluded: set[bytes] | None = None,
+    reject_supplied: bool = False,
 ) -> dict[str, Any]:
     """Verify attested target captures once (race) or twice (strict), never echoes."""
     if not outputs:
@@ -1080,6 +1160,27 @@ def verify_outputs(
                 "reproductions": 0,
             }
         return {"status": "unverified", "reason": "candidate_was_user_input", "flag": None, "reproductions": 0}
+    # Placeholders shipped with the challenge or seen in a local lab are not solves.
+    # Reversing flags legitimately live inside the supplied binary, so callers opt in.
+    supplied: set[bytes] = set()
+    if reject_supplied and workspace is not None:
+        try:
+            session = _json_path(_workspace_root(workspace)[0] / "session.json")
+            supplied = supplied_candidates(Path(str(session["challenge"])), patterns)
+        except (InvalidInput, KeyError, TypeError):
+            supplied = set()
+    lab = excluded or set()
+    remaining = [item for item in independent if item not in supplied and item not in lab]
+    if not remaining:
+        rejected = independent[0]
+        return {
+            "status": "unverified",
+            "reason": "candidate_in_supplied_files" if rejected in supplied else "candidate_matches_lab_flag",
+            "candidate": rejected.decode("utf-8", errors="replace"),
+            "flag": None,
+            "reproductions": 0,
+        }
+    independent = remaining
     return {
         "status": "verified",
         "reason": "reproduced_in_clean_sessions" if strict else "attributable_target_result",

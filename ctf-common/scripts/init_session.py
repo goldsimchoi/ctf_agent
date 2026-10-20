@@ -53,9 +53,10 @@ def main() -> int:
     parser.add_argument("--target")
     parser.add_argument("--binary")
     parser.add_argument("--flag-pattern")
+    parser.add_argument("--callback")
     try:
         args = parser.parse_args()
-        individual = (args.statement, args.target, args.binary, args.flag_pattern)
+        individual = (args.statement, args.target, args.binary, args.flag_pattern, args.callback)
         if args.request_json is not None and any(value is not None for value in individual):
             raise IntakeError("--request-json cannot be mixed with individual intake flags")
         if args.request_json == "-":
@@ -68,6 +69,7 @@ def main() -> int:
                 target=args.target,
                 binary=args.binary,
                 flag_pattern=args.flag_pattern,
+                callback=args.callback,
             )
         else:
             intake = None

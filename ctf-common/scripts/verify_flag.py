@@ -16,6 +16,8 @@ def main() -> int:
     parser.add_argument("--attestation", type=Path, action="append", default=[])
     parser.add_argument("--pattern", action="append", default=[])
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--exclude", action="append", default=[], help="known lab placeholder to reject")
+    parser.add_argument("--reject-supplied", action="store_true", help="reject candidates already in the challenge files")
     try:
         args = parser.parse_args()
         patterns = tuple(item.encode("utf-8") for item in args.pattern) or DEFAULT_PATTERNS
@@ -26,6 +28,8 @@ def main() -> int:
             args.strict,
             workspace=args.workspace,
             attestations=args.attestation or None,
+            excluded={item.encode("utf-8") for item in args.exclude},
+            reject_supplied=args.reject_supplied,
         )
     except InvalidInput as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))
