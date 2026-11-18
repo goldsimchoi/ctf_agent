@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────
+#  Codex CTF 하네스용 config 조각
+#  ~/.codex/config.toml 에 아래 블록들을 "병합"하라 (기존 파일 통째 교체 금지).
+#  install-codex.sh 가 실제 경로를 채운 버전을 생성해 주므로, 수동 병합 시 참고용.
+# ─────────────────────────────────────────────────────────────────────────
+
+# 1) idalib: mrexodia 마켓플레이스의 ida-pro-mcp 플러그인
+[marketplaces.mrexodia]
+source_type = "git"
+source = "https://github.com/mrexodia/codex-marketplace.git"
+
+[plugins."ida-pro-mcp@mrexodia"]
+enabled = true
+
+# 민감/비싼 IDA 툴은 실행 전 승인 (원본 설정과 동일)
+[plugins."ida-pro-mcp@mrexodia".mcp_servers.idalib.tools.idb_open]
+approval_mode = "approve"
+[plugins."ida-pro-mcp@mrexodia".mcp_servers.idalib.tools.decompile]
+approval_mode = "approve"
+[plugins."ida-pro-mcp@mrexodia".mcp_servers.idalib.tools.survey_binary]
+approval_mode = "approve"
+[plugins."ida-pro-mcp@mrexodia".mcp_servers.idalib.tools.analyze_function]
+approval_mode = "approve"
+
+# 2) gdb MCP
+#    경로는 새 PC 기준. `uv tool install gdb-mcp` 하면 ~/.local/bin/gdb-mcp 가 생긴다.
+#    (원본 PC는 /home/normalone/venv/bin/gdb-mcp 였음 — 통일 권장)
+[mcp_servers.gdb]
+command = "REPLACE_WITH_ABS_PATH/gdb-mcp"
+
+[mcp_servers.gdb.tools.batch_commands]
+approval_mode = "approve"
+[mcp_servers.gdb.tools.start_binary]
+approval_mode = "approve"
